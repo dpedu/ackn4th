@@ -138,9 +138,13 @@ func login(cmd *cobra.Command, a *app, providers []string, reauth bool, gcpProje
 			return err
 		}
 	}
+	// A key piped or redirected in replaces the stored one, as a key typed
+	// at the prompt would. With several providers it couldn't be told
+	// whose it is, so then only --reauth asks.
+	newKey := reauth || (len(sel) == 1 && keyPiped())
 	var verified []string
 	for _, p := range sel {
-		if err := loginProvider(cmd.Context(), a, p, reauth); err != nil {
+		if err := loginProvider(cmd.Context(), a, p, reauth, newKey); err != nil {
 			// The provider's name is already the line's first column.
 			msg := strings.TrimPrefix(err.Error(), p+": ")
 			t.Println(" ", t.Red("✗"), " ", t.ProviderColor(p, fmt.Sprintf("%-11s", p)), " ", inline(t, msg))
@@ -215,13 +219,27 @@ func saveGCPProject(a *app, project string) error {
 
 // loginProvider makes sure p can be used: it runs the sign-in (or asks
 // for the Gemini key) when needed, then verifies with a real API call.
-func loginProvider(ctx context.Context, a *app, p string, reauth bool) error {
+// newKey asks for an API key even when one is stored (reauth, or a key
+// piped in); reauth alone redoes OAuth and CLI sign-ins.
+func loginProvider(ctx context.Context, a *app, p string, reauth, newKey bool) (err error) {
 	t := a.term
 	gc := a.cfg.Providers["gemini"]
 	how := "OAuth grant verified"
+	// A key entered here is kept only if it verifies: otherwise the key it
+	// replaced (or none) goes back, so the next login asks again instead of
+	// re-checking a key that was just rejected.
+	var undo func() error
+	defer func() {
+		if err != nil && undo != nil {
+			if uerr := undo(); uerr != nil {
+				err = errors.Join(err, fmt.Errorf("putting back the previous key: %w", uerr))
+			}
+		}
+	}()
 	switch {
 	case p == "gemini" && gc.GeminiAuth() == config.GeminiKey:
-		if reauth || !auth.HasGeminiKey() {
+		if newKey || !auth.HasGeminiKey() {
+			undo = keepKey(auth.GeminiKey, auth.SaveGeminiKey, auth.ForgetGeminiKey)
 			if err := askGeminiKey(a); err != nil {
 				return err
 			}
@@ -235,11 +253,12 @@ func loginProvider(ctx context.Context, a *app, p string, reauth bool) error {
 		if err := saveGCPProject(a, project); err != nil {
 			return err
 		}
-		return loginProvider(ctx, a, p, reauth)
+		return loginProvider(ctx, a, p, reauth, newKey)
 	case p == "gemini" && gc.GeminiAuth() != config.GeminiVertex:
 		return fmt.Errorf("providers.gemini.auth: %q is not key or vertex", gc.Auth)
 	case p == "openai":
-		if reauth || !auth.HasOpenAIKey() {
+		if newKey || !auth.HasOpenAIKey() {
+			undo = keepKey(auth.OpenAIKey, auth.SaveOpenAIKey, auth.ForgetOpenAIKey)
 			if err := askOpenAIKey(a); err != nil {
 				return err
 			}
@@ -332,6 +351,27 @@ func (a *app) chooseOpenAIModel(ctx context.Context, op *openai.Provider) (provi
 	pc.Model = m
 	a.cfg.Providers[openai.Name] = pc
 	return a.newProvider(openai.Name)
+}
+
+// keepKey remembers the key stored now and returns a func that puts it
+// back, or deletes the key when there was none.
+func keepKey(get func() (string, error), save func(string) error, forget func() error) func() error {
+	prev, err := get()
+	if err != nil {
+		return forget
+	}
+	return func() error { return save(prev) }
+}
+
+// keyPiped reports whether stdin is a pipe or a file, i.e. a key is being
+// handed in. A terminal or /dev/null (a script just checking the stored
+// key) is not.
+func keyPiped() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeNamedPipe != 0 || fi.Mode().IsRegular()
 }
 
 // askGeminiKey reads an AI Studio key without echoing it and stores it in

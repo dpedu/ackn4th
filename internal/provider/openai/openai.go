@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -83,7 +84,7 @@ func (p *Provider) Verify(ctx context.Context) error {
 	if p.cfg.Model == "" {
 		return ErrNoModel
 	}
-	return describe(p.probe(ctx, p.cfg.Model))
+	return p.describe(p.probe(ctx, p.cfg.Model))
 }
 
 // probe sends model a tiny request with a tool, as an agent's would be.
@@ -112,7 +113,7 @@ func (p *Provider) PickModel(ctx context.Context) (string, error) {
 		}
 	}
 	if err := iter.Err(); err != nil {
-		return "", describe(err)
+		return "", p.describe(err)
 	}
 	slices.SortStableFunc(models, func(a, b openai.Model) int {
 		return cmp.Or(cmp.Compare(tier(a.ID), tier(b.ID)), cmp.Compare(b.Created, a.Created), strings.Compare(a.ID, b.ID))
@@ -128,7 +129,7 @@ func (p *Provider) PickModel(ctx context.Context) (string, error) {
 		}
 		var apiErr *openai.Error
 		if !errors.As(err, &apiErr) || apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusTooManyRequests {
-			return "", describe(err) // the key or the network, not the model
+			return "", p.describe(err) // the key or the network, not the model
 		}
 		// Messages name the model: without it, equal reasons group.
 		why := strings.ReplaceAll(strings.TrimRight(apiErr.Message, ". "), m.ID, "this model")
@@ -331,7 +332,7 @@ func (s *session) compact(ctx context.Context) (provider.Usage, error) {
 	p.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptionsNone)}
 	resp, err := s.p.client.Responses.New(ctx, p, input)
 	if err != nil {
-		return cost, fmt.Errorf("compacting context: %w", describe(err))
+		return cost, fmt.Errorf("compacting context: %w", s.p.describe(err))
 	}
 	cost = usage(resp.Usage)
 	summary := resp.OutputText()
@@ -435,7 +436,7 @@ func (s *session) send(ctx context.Context, st provider.Stream) (*provider.Reply
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return nil, describe(err)
+		return nil, s.p.describe(err)
 	}
 	if failed != "" {
 		return nil, errors.New("openai: " + failed)
@@ -544,7 +545,7 @@ func plainReasoning(o outItem) json.RawMessage {
 }
 
 // describe turns API errors into short messages. The key is never included.
-func describe(err error) error {
+func (p *Provider) describe(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -553,7 +554,11 @@ func describe(err error) error {
 		msg := apiErr.Message
 		switch apiErr.StatusCode {
 		case http.StatusUnauthorized:
-			return errors.New("openai: the API key was rejected: run `ackn4th login --provider openai` with a new one from " + KeyURL)
+			if u, perr := url.Parse(p.cfg.BaseURL); perr == nil && u.Host != "" {
+				// Another API's message often says which key it saw (****1a2b).
+				return fmt.Errorf("openai: %s rejected the API key (%s): run `ackn4th login --provider openai --reauth` with a valid one", u.Host, cmpOr(msg, "HTTP 401"))
+			}
+			return errors.New("openai: the API key was rejected: run `ackn4th login --provider openai --reauth` with a new one from " + KeyURL)
 		case http.StatusPaymentRequired: // DeepSeek, out of balance
 			return errors.New("openai: out of API credits: top up the account's balance: " + cmpOr(msg, "insufficient balance"))
 		case http.StatusTooManyRequests:

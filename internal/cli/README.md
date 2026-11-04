@@ -90,6 +90,8 @@ cd ~/code/my-project
 
 # 1. Sign in to providers (once: they stay signed in until logout).
 #    API keys come from stdin, never from a flag or an environment variable:
+#    A piped key replaces the stored one; a key that fails the check is
+#    never kept (the previous one stays).
 op read op://dev/openai/key | ackn4th login --provider openai
 #    An agent CLI already signed in (on this machine, or in the container)
 #    is just checked and put to use:
