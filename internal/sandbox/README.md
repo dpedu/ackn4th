@@ -47,7 +47,10 @@ The provider clients ignore `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
 `OPENAI_BASE_URL` and friends. Endpoints are pinned to `api.anthropic.com`,
 `api.openai.com`, `generativelanguage.googleapis.com` and Google's
 `aiplatform.googleapis.com` hosts, so nothing in the shell can swap
-credentials or redirect a token.
+credentials or redirect a token. The one exception is
+`providers.openai.base_url` in `config.yaml`, which agents can't read or
+write: https only (http only to localhost), with the API key kept per host,
+so changing it can't send an existing key somewhere new.
 
 **Rate limits.** API-key clients (OpenAI, Gemini with a key) share one gate
 per key. It reads the provider's rate-limit headers, holds requests when

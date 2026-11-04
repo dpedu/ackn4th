@@ -161,3 +161,39 @@ func TestOSLocations(t *testing.T) {
 		t.Errorf("config %s, data %s; want %s, %s", cfg, data, want[0], want[1])
 	}
 }
+
+func TestBaseURL(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://api.deepseek.com":       "https://api.deepseek.com/",
+		"https://example.com/v1/":        "https://example.com/v1/",
+		"http://localhost:11434/v1":      "http://localhost:11434/v1/",
+		"http://127.0.0.1:8000":          "http://127.0.0.1:8000/",
+		"http://api.deepseek.com":        "",
+		"https://user:pw@example.com":    "",
+		"https://example.com/?key=x":     "",
+		"ftp://example.com":              "",
+		"api.deepseek.com":               "",
+		"http://localhost.evil.com:8000": "",
+	} {
+		got, err := CheckBaseURL(raw)
+		if want == "" && err == nil {
+			t.Errorf("%s: accepted as %s", raw, got)
+		} else if want != "" && got != want {
+			t.Errorf("%s: %q, %v; want %s", raw, got, err, want)
+		}
+	}
+
+	dir := t.TempDir()
+	t.Setenv(HomeEnv, dir)
+	os.MkdirAll(filepath.Join(dir, "config"), 0o700)
+	write := func(s string) { os.WriteFile(filepath.Join(dir, "config", "config.yaml"), []byte(s), 0o600) }
+	write("providers:\n  openai: {base_url: https://api.deepseek.com, model: deepseek-v4-pro}\n")
+	cfg, err := Load()
+	if err != nil || cfg.Providers["openai"].BaseURL != "https://api.deepseek.com/" {
+		t.Errorf("openai base_url: %+v, %v", cfg.Providers["openai"], err)
+	}
+	write("providers:\n  claude: {base_url: https://example.com}\n")
+	if _, err := Load(); err == nil {
+		t.Error("base_url on claude accepted")
+	}
+}

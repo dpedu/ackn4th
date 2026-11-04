@@ -17,6 +17,7 @@ providers:
   gemini: {model: gemini-3.1-pro-preview, max_tokens: 65536, compact_at: 200000}   # auth: key (AI Studio)
   claude-code: {model: claude-sonnet-5-5, effort: medium}   # your Claude plan via local Claude Code
   openai: {max_tokens: 32000, effort: medium}  # model: login picks the newest your key can use
+  # another API in OpenAI's format:  openai: {base_url: https://api.deepseek.com, model: deepseek-v4-pro}
   codex: {model: default}                 # "default" lets the CLI choose; also cursor, copilot
   # Vertex AI instead:  gemini: {auth: vertex, project: my-gcp-project, location: global}
 agents:                                   # named per-agent presets (see internal/provider/README.md)
@@ -77,3 +78,14 @@ ackn4th keeps its files where each OS expects an app's files:
 
 Task state lives in `<data>/tasks/<id>/` ([what's in it](../task/README.md#code)).
 Project notes are in `<data>/projects/<hash>/notes.md`.
+
+## TODO
+
+- **Paths relative to `config.yaml`.** `workspace_roots` (and
+  `default_workspace_root`) take absolute paths or `~/…`; a relative path is
+  resolved against the directory ackn4th runs in (`ExpandPath`), and `trust`
+  always writes absolute paths. Resolve relative paths against the folder
+  holding `config.yaml` instead, and have `trust` write them relative when
+  the directory sits under that folder, so a config can be copied along
+  with its projects (e.g. a run template under `data/`) and still point at
+  its own copies.

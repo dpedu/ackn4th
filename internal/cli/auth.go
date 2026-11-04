@@ -349,6 +349,12 @@ func askGeminiKey(a *app) error {
 // askOpenAIKey is askGeminiKey for OpenAI.
 func askOpenAIKey(a *app) error {
 	t := a.term
+	if host := auth.OpenAIHost(); host != "" {
+		return askKey(a, "openai", "API KEY FOR "+strings.ToUpper(host), []string{
+			"providers.openai.base_url points at " + t.Lime(host) + ": paste its API key below",
+			t.Gray("(hidden; stored only in your " + auth.SecretStore() + ", for that host alone)"),
+		}, auth.SaveOpenAIKey)
+	}
 	return askKey(a, "openai", "OPENAI API KEY", []string{
 		"1. Open " + t.Lime(auth.OpenAIKeyURL) + " and sign in",
 		"2. Create new secret key " + t.Gray("(a project key with model access is enough)"),

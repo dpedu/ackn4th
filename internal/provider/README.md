@@ -101,6 +101,35 @@ model that wrote them. `resume-task --provider claude-code` (or **Run on**
 in the dashboard's resume dialog) moves a stopped task's agents to another
 provider, e.g. when API credits run out.
 
+### OpenAI-compatible APIs
+
+`providers.openai.base_url` points the `openai` provider at another
+OpenAI-compatible API, such as DeepSeek. The API must support OpenAI's
+[Responses API](https://platform.openai.com/docs/api-reference/responses)
+(`POST /responses`): one that only speaks Chat Completions
+(`/chat/completions`) won't work. Set the model as well: login only picks
+one on OpenAI itself.
+
+```yaml
+providers:
+  openai: {base_url: https://api.deepseek.com, model: deepseek-v4-pro, effort: high}
+spend:
+  prices:
+    deepseek-v4-pro: {input: 1.32, cached: 0.044, output: 3.96}
+    deepseek-flash: {input: 0.30, cached: 0.006, output: 1.20}
+```
+
+```sh
+printf '%s\n' "$DEEPSEEK_API_KEY" | ackn4th login --provider openai
+```
+
+The base URL is read only from `config.yaml`, never from the environment.
+It must be https (http only to `localhost`). The key is stored for that
+host alone: after a change to `base_url`, sign in again, and OpenAI's key
+never goes anywhere else. APIs that return reasoning as text (DeepSeek)
+show it live, and it goes back with each later request, as they require
+once tools are in play.
+
 ## Code
 
 ```

@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -39,6 +40,25 @@ type Provider struct {
 	// for Gemini with auth: vertex.
 	Project  string `yaml:"project,omitempty"`
 	Location string `yaml:"location,omitempty"`
+	// BaseURL points openai at another API in OpenAI's Responses format
+	// (DeepSeek, a local server, ...). It is read only from this file,
+	// never the environment, and the API key is kept per host, so a
+	// changed base_url needs its own login. Empty is api.openai.com.
+	BaseURL string `yaml:"base_url,omitempty"`
+}
+
+// CheckBaseURL validates a base_url and returns it with a trailing slash.
+// It must be https, or http to this machine for a local server.
+func CheckBaseURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("base_url %q is not a plain http(s) URL", raw)
+	}
+	local := slices.Contains([]string{"localhost", "127.0.0.1", "::1"}, u.Hostname())
+	if u.Scheme != "https" && !(u.Scheme == "http" && local) {
+		return "", fmt.Errorf("base_url %q must use https (http only to localhost)", raw)
+	}
+	return strings.TrimRight(u.String(), "/") + "/", nil
 }
 
 // ErrNoModel is returned when an agent's provider has no model configured
@@ -312,6 +332,18 @@ func Load() (Config, error) {
 		}
 		if p.CompactAt == 0 {
 			p.CompactAt = def.CompactAt
+		}
+		cfg.Providers[name] = p
+	}
+	for name, p := range cfg.Providers {
+		if p.BaseURL == "" {
+			continue
+		}
+		if name != "openai" {
+			return Default(), fmt.Errorf("%s: providers.%s.base_url: only openai takes a base_url", path, name)
+		}
+		if p.BaseURL, err = CheckBaseURL(p.BaseURL); err != nil {
+			return Default(), fmt.Errorf("%s: providers.%s.%w", path, name, err)
 		}
 		cfg.Providers[name] = p
 	}

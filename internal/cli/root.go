@@ -137,7 +137,7 @@ func (a *app) providerFor(spec task.AgentSpec) (provider.Provider, error) {
 		if err != nil {
 			return nil, err
 		}
-		return openai.New(openai.Config{APIKey: key, Model: spec.Model, MaxTokens: spec.MaxTokens, Effort: spec.Effort, CompactAt: spec.CompactAt}), nil
+		return openai.New(openai.Config{APIKey: key, Model: spec.Model, MaxTokens: spec.MaxTokens, Effort: spec.Effort, CompactAt: spec.CompactAt, BaseURL: pc.BaseURL}), nil
 	case clis.CodexName, clis.CursorName, clis.CopilotName:
 		return cliagent.New(auth.CLIDriver(spec.Provider), spec.Model, spec.Effort), nil
 	case claudecode.Name:
@@ -323,7 +323,7 @@ func (a *app) pickOpenAIModel(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	m, err := openai.New(openai.Config{APIKey: key}).PickModel(ctx)
+	m, err := openai.New(openai.Config{APIKey: key, BaseURL: a.cfg.Providers[openai.Name].BaseURL}).PickModel(ctx)
 	if err != nil {
 		return fmt.Errorf("%w for openai, and none could be picked (%v): set one with C in the dashboard (Models) or providers.openai.model", config.ErrNoModel, err)
 	}

@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/dethmasque/ackn4th/internal/config"
@@ -82,11 +83,32 @@ func geminiKeyGrant() (*Grant, error) {
 // OpenAIKeyURL is where users create an OpenAI API key.
 const OpenAIKeyURL = "https://platform.openai.com/api-keys"
 
-func openAIKeyEntry() string {
-	if h, ok := config.Sandbox(); ok {
-		return "sandbox:" + h + ":openai-api-key"
+// OpenAIHost is the host providers.openai.base_url points at, or empty
+// for OpenAI itself.
+func OpenAIHost() string {
+	cfg, err := config.Load()
+	if err != nil {
+		return ""
 	}
-	return "openai-api-key"
+	u, err := url.Parse(cfg.Providers["openai"].BaseURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+// openAIKeyEntry names the key's keychain entry. A key for another host
+// (base_url) has its own entry, so editing base_url can never send a key
+// to a host it wasn't given for.
+func openAIKeyEntry() string {
+	name := "openai-api-key"
+	if host := OpenAIHost(); host != "" {
+		name += ":" + host
+	}
+	if h, ok := config.Sandbox(); ok {
+		return "sandbox:" + h + ":" + name
+	}
+	return name
 }
 
 // ErrNoOpenAIKey means no OpenAI API key is stored.
@@ -96,7 +118,12 @@ var ErrNoOpenAIKey = errors.New("openai: no API key stored: run `ackn4th login -
 // secret store, deleted on logout.
 func SaveOpenAIKey(key string) error {
 	key = strings.TrimSpace(key)
-	if !strings.HasPrefix(key, "sk-") || len(key) < 20 || strings.ContainsAny(key, " \t\r\n\"'") {
+	if host := OpenAIHost(); host != "" {
+		// Other services' keys take any shape.
+		if key == "" || strings.ContainsAny(key, " \t\r\n\"'") {
+			return errors.New("that doesn't look like an API key for " + host)
+		}
+	} else if !strings.HasPrefix(key, "sk-") || len(key) < 20 || strings.ContainsAny(key, " \t\r\n\"'") {
 		return errors.New("that doesn't look like an OpenAI API key (they start with sk-): create one at " + OpenAIKeyURL)
 	}
 	return secretSet(service, openAIKeyEntry(), key)

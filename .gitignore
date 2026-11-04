@@ -5,3 +5,4 @@ dist/
 *.db
 *.log
 *.tar.gz
+/data/

@@ -1,5 +1,5 @@
 // Package openai implements provider.Provider with the OpenAI Responses
-// API and an API key. Requests set store to false: OpenAI keeps no
+// API and an API key, on OpenAI or (base_url) another API in its format. Requests set store to false: OpenAI keeps no
 // conversation, and ackn4th saves it with the task as usual.
 //
 // Requests go through a rate-limit gate shared by every agent on the same
@@ -47,7 +47,8 @@ type Config struct {
 	// CompactAt is the prompt size, in tokens, past which the conversation
 	// is summarized at the start of the next turn (0 never).
 	CompactAt int64
-	// BaseURL overrides the endpoint, for tests only.
+	// BaseURL is another API in the Responses format (providers.openai.
+	// base_url, already checked); empty is OpenAI.
 	BaseURL string
 }
 
@@ -412,6 +413,10 @@ func (s *session) send(ctx context.Context, st provider.Stream) (*provider.Reply
 			if st.Text != nil && ev.Delta != "" {
 				st.Text(ev.Delta)
 			}
+		case "response.reasoning_text.delta": // compatible APIs show their reasoning
+			if st.Thinking != nil && ev.Delta != "" {
+				st.Thinking(ev.Delta)
+			}
 		case "response.output_item.added":
 			if ev.Item.Type == "function_call" && st.ToolInput != nil {
 				st.ToolInput(ev.Item.Name, "")
@@ -470,7 +475,12 @@ func (s *session) record(resp *responses.Response) *provider.Reply {
 		switch o.Type {
 		case "reasoning":
 			if o.EncryptedContent == "" {
-				continue // useless without store
+				// Compatible APIs (DeepSeek) return reasoning as text instead,
+				// and refuse a tool loop's history without it.
+				if it := plainReasoning(o); it != nil {
+					s.items = append(s.items, it)
+				}
+				continue // OpenAI's is useless without store
 			}
 			summary := o.Summary // an array, sent back as it came
 			if len(summary) == 0 || string(summary) == "null" {
@@ -515,6 +525,24 @@ func (s *session) record(resp *responses.Response) *provider.Reply {
 	return reply
 }
 
+// plainReasoning keeps a reasoning item's text, or nil when it has none.
+func plainReasoning(o outItem) json.RawMessage {
+	var parts []map[string]string
+	for _, c := range o.Content {
+		if c.Text != "" {
+			parts = append(parts, map[string]string{"type": "reasoning_text", "text": c.Text})
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	it := map[string]any{"type": "reasoning", "summary": []any{}, "content": parts}
+	if o.ID != "" {
+		it["id"] = o.ID
+	}
+	return jsonItem(it)
+}
+
 // describe turns API errors into short messages. The key is never included.
 func describe(err error) error {
 	if err == nil {
@@ -526,6 +554,8 @@ func describe(err error) error {
 		switch apiErr.StatusCode {
 		case http.StatusUnauthorized:
 			return errors.New("openai: the API key was rejected: run `ackn4th login --provider openai` with a new one from " + KeyURL)
+		case http.StatusPaymentRequired: // DeepSeek, out of balance
+			return errors.New("openai: out of API credits: top up the account's balance: " + cmpOr(msg, "insufficient balance"))
 		case http.StatusTooManyRequests:
 			if strings.Contains(apiErr.Code, "insufficient_quota") {
 				return errors.New("openai: out of API credits: add billing at https://platform.openai.com/settings/organization/billing")
