@@ -20,19 +20,53 @@ import (
 // prompt links to go into the brief, --repo clones with gh's credentials,
 // and --draft-pr (or open-pr) proposes the agents' changes.
 
+// repoPath is where a clone of repo goes on this host: its name inside the
+// first workspace root, the same place --scratch puts a task. Both ends agree
+// because both call this - the client to say where the work will happen, the
+// controller to know which directory to make.
+func (a *app) repoPath(repo string, allowed []string) (string, error) {
+	owner, name, err := github.ParseRepo(repo)
+	if err != nil {
+		return "", err
+	}
+	if owner == "" || name == "" {
+		return "", fmt.Errorf("%q is not a repository", repo)
+	}
+	// The name becomes a directory inside a workspace root, so it has to be
+	// one: "." is the root itself and ".." is its parent. ParseRepo's pattern
+	// lets both through ("owner/.", "owner/..", and "owner/..git" whose name
+	// is "."), and since the daemon computes this path and records it, that is
+	// now a decision about which directory to work in, not a display detail.
+	if strings.Trim(name, ".") == "" {
+		return "", fmt.Errorf("github: %q is not a repository name", repo)
+	}
+	if len(allowed) == 0 {
+		return "", fmt.Errorf("no workspace roots are configured for --repo: set workspace_roots on the host that runs the tasks")
+	}
+	dir := filepath.Join(allowed[0], name)
+	if filepath.Dir(dir) != filepath.Clean(allowed[0]) {
+		return "", fmt.Errorf("github: %q would not clone inside %s", repo, allowed[0])
+	}
+	return dir, nil
+}
+
 // repoDir is where --repo works on repo: its clone in the default
 // workspace root, and whether one is there already. It changes nothing,
 // so the new-task form can show it as you type.
 func (a *app) repoDir(repo string) (dir string, exists bool, err error) {
-	_, name, err := github.ParseRepo(repo)
-	if err != nil {
-		return "", false, err
-	}
 	allowed, err := a.cfg.AllowedRoots()
 	if err != nil {
 		return "", false, err
 	}
-	dir = filepath.Join(allowed[0], name)
+	if dir, err = a.repoPath(repo, allowed); err != nil {
+		return "", false, err
+	}
+	if a.remote() {
+		// Where the daemon will put the clone. Whether one is already there is
+		// a question for that host, so the form shows "clones to" and not
+		// "reuses the clone".
+		return dir, false, nil
+	}
 	_, err = os.Stat(filepath.Join(dir, ".git"))
 	return dir, err == nil, nil
 }
@@ -44,7 +78,14 @@ func (a *app) repoWorkspace(ctx context.Context, repo string, allowed []string, 
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(allowed[0], name)
+	// One rule for where a clone of owner/name goes: repoPath's. That is what
+	// the client records as the task's workspace and what prepareWorkspace
+	// names before the clone; deriving it again here was a second answer, and
+	// "owner/.." named the root's parent (R75).
+	dir, err := a.repoPath(repo, allowed)
+	if err != nil {
+		return "", err
+	}
 	say := func(s string) {
 		if !quiet {
 			a.term.Println(a.term.Gray("  " + s))
@@ -75,6 +116,14 @@ func (a *app) useBranch(ctx context.Context, ws, branch string, quiet bool) erro
 	if branch == "" {
 		return nil
 	}
+	// A client cannot see the daemon's checkout and must not stat or switch
+	// it: `--repo owner/name --branch feature/x` failed here with
+	// "--branch: /srv/… isn't a git repository", naming a path the person
+	// never typed. The checkout happens on the machine with the clone, and the
+	// task's record carries the branch.
+	if a.remote() {
+		return nil
+	}
 	if _, err := os.Stat(filepath.Join(ws, ".git")); err != nil {
 		return fmt.Errorf("--branch: %s isn't a git repository", ws)
 	}
@@ -94,29 +143,112 @@ func (a *app) useBranch(ctx context.Context, ws, branch string, quiet bool) erro
 	return nil
 }
 
-// fetchGitHub saves the issues and pull requests the prompt links to, for
-// the brief. Without gh it says so and goes on: the agents then see only
-// the links. A link gh can't read stops the task from starting.
-func (a *app) fetchGitHub(ctx context.Context, tk *task.Task, quiet bool) error {
-	refs := github.Refs(tk.Prompt)
-	if len(refs) == 0 {
+// prepareWorkspace makes the task's workspace ready on this host, where the
+// work will happen: it clones the repository with this host's gh login, and
+// records where the clone actually landed. The client cannot do any of it - it
+// has no path here, and its github.md would go to a data dir no runner reads.
+//
+// It is safe on a task with no repository and no branch, and safe to call
+// twice: a clone that already exists is reused.
+func (a *app) prepareWorkspace(ctx context.Context, tk *task.Task) error {
+	if tk.Repo == "" {
 		return nil
+	}
+	allowed, err := a.cfg.AllowedRoots()
+	if err != nil {
+		return err
+	}
+	// Record where the clone is meant to land before making it, so a crash
+	// mid-clone leaves a task that says where it was going rather than nowhere.
+	want, err := a.repoPath(tk.Repo, allowed)
+	if err != nil {
+		return err
+	}
+	if err := a.recordWorkspace(tk.ID, want); err != nil {
+		return err
+	}
+	tk.Workspace = want
+	// A clone of a big repository takes minutes. Save only this field, and
+	// only from a record read after the clone: rewriting the copy this call
+	// started with would undo anything changed while it ran (R38).
+	dir, err := a.repoWorkspace(ctx, tk.Repo, allowed, true)
+	if err != nil {
+		return err
+	}
+	if err := a.recordWorkspace(tk.ID, dir); err != nil {
+		return err
+	}
+	tk.Workspace = dir
+	return nil
+}
+
+// recordWorkspace points a task at dir, re-reading the record first so that a
+// save made after a long clone touches one field and nothing else.
+func (a *app) recordWorkspace(id, dir string) error {
+	fresh, err := a.backend().Load(id)
+	if err != nil {
+		return err
+	}
+	if fresh.Workspace == dir {
+		return nil
+	}
+	fresh.Workspace = dir
+	if err := a.backend().Save(fresh); err != nil {
+		return fmt.Errorf("record the workspace %s: %w", dir, err)
+	}
+	return nil
+}
+
+// remoteVCSErr names the two flags a client cannot honour. The branch is
+// checked out, and the pull request opened, where the workspace is - on the
+// machine running the controller - and this build has no request that asks it
+// to. Accepting them quietly would be worse than refusing: the record carries
+// the name, nothing on the host acts on it, and the agents' commits land on
+// whichever branch the clone already had.
+func remoteVCSErr(branch string, draftPR bool) error {
+	switch {
+	case branch != "":
+		return errors.New("--branch: the branch is checked out where the workspace is, on the controller, and this build cannot ask it to switch yet: check it out on that host, or drop --branch")
+	case draftPR:
+		return errors.New("--draft-pr: the pull request is opened where the workspace is, on the controller, and this build cannot ask it to yet: drop --draft-pr, or run the task on that host")
+	}
+	return nil
+}
+
+// checkDraftPR is --draft-pr's preflight: gh must be signed in and the
+// workspace must be a clone of a GitHub repository. Like useBranch it only
+// means something where the workspace is, so a client skips it.
+func (a *app) checkDraftPR(ctx context.Context, ws string) error {
+	if a.remote() {
+		return nil
+	}
+	return github.CheckPR(ctx, ws)
+}
+
+// githubBrief reads the issues and pull requests the prompt links to, for the
+// brief. It runs where gh is signed in - usually the person's machine, which is
+// the client - and returns the text; createTask then sends it to the host that
+// runs the task, because a client's data dir is not where a runner looks (R62).
+//
+// Without gh it says so and goes on: the agents then see only the links. A link
+// gh can't read stops the task from starting.
+func (a *app) githubBrief(ctx context.Context, prompt string, quiet bool) (string, error) {
+	refs := github.Refs(prompt)
+	if len(refs) == 0 {
+		return "", nil
 	}
 	t := a.term
 	if _, err := github.Status(ctx); err != nil {
 		if !quiet {
 			t.Println(t.Amber("  ! "), inline(t, "the prompt links to GitHub, but "+strings.TrimPrefix(err.Error(), "github: ")+"; agents will see only the links, as they have no network"))
 		}
-		return nil
+		return "", nil
 	}
 	fctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	md, err := github.Context(fctx, refs)
 	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(a.store.GitHubPath(tk.ID), []byte(md), 0o600); err != nil {
-		return err
+		return "", err
 	}
 	if !quiet {
 		var names []string
@@ -125,7 +257,27 @@ func (a *app) fetchGitHub(ctx context.Context, tk *task.Task, quiet bool) error 
 		}
 		t.Println(t.Green("  ✓ "), t.Gray("read from GitHub into the brief: "+strings.Join(names, ", ")))
 	}
-	return nil
+	return md, nil
+}
+
+// createTask creates tk and stores the GitHub context next to it, wherever the
+// task will run: the controller carries the file over gRPC, so a client never
+// writes its own copy (Briefed). A backend that cannot carry one is
+// given a plain Create and the file goes in this host's data dir, which is where
+// its runners read - they run here.
+func (a *app) createTask(tk *task.Task, ghContext string) error {
+	if ghContext != "" {
+		if br, ok := a.backend().(task.Briefed); ok {
+			return br.CreateWithBrief(tk, ghContext)
+		}
+	}
+	if err := a.backend().Create(tk); err != nil {
+		return err
+	}
+	if ghContext == "" {
+		return nil
+	}
+	return os.WriteFile(a.store.GitHubPath(tk.ID), []byte(ghContext), 0o600)
 }
 
 // openPR proposes the agents' changes as a draft pull request and records
@@ -211,7 +363,7 @@ when the task completes.`,
 			if err != nil {
 				return err
 			}
-			a.store.Reconcile(tk)
+			a.backend().Reconcile(tk)
 			if tk.PR != "" {
 				return fmt.Errorf("task %s already has a draft pull request: %s", tk.Label(), tk.PR)
 			}
@@ -225,7 +377,7 @@ when the task completes.`,
 			if err := a.openPR(cmd.Context(), tk, r.ChangedFiles(tk.ID)); err != nil {
 				return err
 			}
-			if err := a.store.Save(tk); err != nil {
+			if err := a.backend().Save(tk); err != nil {
 				return err
 			}
 			a.term.Println(a.term.Green("✓ "), "draft pull request: ", a.term.Lime(tk.PR))

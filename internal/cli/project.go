@@ -30,7 +30,7 @@ func (a *app) projectDir(args []string) (string, error) {
 				return filepath.EvalSymlinks(abs)
 			}
 		}
-		if tk, err := a.store.Find(dir); err == nil {
+		if tk, err := a.backend().Find(dir); err == nil {
 			return tk.Workspace, nil
 		}
 	}

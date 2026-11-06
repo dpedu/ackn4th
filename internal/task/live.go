@@ -42,6 +42,9 @@ func (s *Store) LivePath(id string, n int) string {
 
 // ReadLive returns agent n's streaming output, or nil when it has none.
 func (s *Store) ReadLive(id string, n int) *Live {
+	if checkID(id) != nil {
+		return nil
+	}
 	data, err := os.ReadFile(s.LivePath(id, n))
 	if err != nil {
 		return nil
@@ -62,7 +65,7 @@ const (
 // liveFeed collects streamed events per agent and writes them out, at most
 // every liveEvery per agent.
 type liveFeed struct {
-	store *Store
+	comm  Backend
 	mu    sync.Mutex
 	feeds map[liveKey]*feed
 }
@@ -80,7 +83,7 @@ type feed struct {
 	dirty      bool
 }
 
-func newLiveFeed(s *Store) *liveFeed { return &liveFeed{store: s, feeds: map[liveKey]*feed{}} }
+func newLiveFeed(b Backend) *liveFeed { return &liveFeed{comm: b, feeds: map[liveKey]*feed{}} }
 
 // Handle folds one event into its agent's feed.
 func (lf *liveFeed) Handle(id string, e event.Event) {
@@ -100,7 +103,7 @@ func (lf *liveFeed) Handle(id string, e event.Event) {
 					f.timer.Stop()
 				}
 				delete(lf.feeds, k)
-				os.Remove(lf.store.LivePath(k.task, k.agent))
+				lf.comm.ClearLive(k.task, k.agent)
 			}
 		}
 		return
@@ -154,10 +157,7 @@ func (lf *liveFeed) flush(k liveKey, f *feed) {
 	}
 	f.dirty, f.last = false, time.Now()
 	f.live.Updated = f.last
-	data, err := json.Marshal(f.live)
-	if err == nil {
-		writeAtomic(lf.store.LivePath(k.task, k.agent), data)
-	}
+	lf.comm.WriteLive(k.task, k.agent, f.live)
 }
 
 // clear removes every feed's file, when a runner exits.
@@ -170,7 +170,7 @@ func (lf *liveFeed) clear(id string, agents int) {
 			f.timer.Stop()
 		}
 		delete(lf.feeds, k)
-		os.Remove(lf.store.LivePath(id, n))
+		lf.comm.ClearLive(id, n)
 	}
 }
 

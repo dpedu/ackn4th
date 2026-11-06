@@ -288,7 +288,7 @@ func (rn *run) addTodo(n int, text string) (int, error) {
 		id = max(id, td.ID+1)
 	}
 	t.Todos = append(t.Todos, Todo{ID: id, Text: text, By: t.Agents[n-1].Role, Round: t.Round, Time: time.Now()})
-	return id, rn.r.Store.Save(t)
+	return id, rn.r.comm().Save(t)
 }
 
 // resolveTodo closes item id on agent n's (1-based) word.
@@ -304,7 +304,7 @@ func (rn *run) resolveTodo(n, id int, note string) error {
 			return fmt.Errorf("item #%d is already closed", id)
 		}
 		td.Done, td.Note = true, strings.TrimSpace(note+" ("+rn.t.Agents[n-1].Role+")")
-		return rn.r.Store.Save(rn.t)
+		return rn.r.comm().Save(rn.t)
 	}
 	return fmt.Errorf("there is no item #%d", id)
 }
@@ -381,7 +381,7 @@ func (rn *run) send(from, to int, text string) error {
 		id = max(id, m.ID+1)
 	}
 	t.Inbox = append(t.Inbox, Mail{ID: id, From: from, To: to, Round: t.Round, Text: text, Time: time.Now().UTC()})
-	return rn.r.Store.Save(t)
+	return rn.r.comm().Save(t)
 }
 
 // inbox formats agent n's undelivered messages. The returned ack removes
@@ -408,7 +408,7 @@ func (rn *run) inbox(n int) (string, func()) {
 		rn.mu.Lock()
 		defer rn.mu.Unlock()
 		rn.t.Inbox = slices.DeleteFunc(rn.t.Inbox, func(m Mail) bool { return slices.Contains(ids, m.ID) })
-		rn.r.Store.Save(rn.t)
+		rn.r.comm().Save(rn.t)
 	}
 }
 
@@ -557,7 +557,7 @@ func (rn *run) turn(ctx context.Context, n int, input string) (agent.TurnResult,
 	// Follow-ups can't be added while the task runs, so the input had
 	// them all.
 	s.FollowUpsSeen = len(t.FollowUps)
-	return res, rn.r.Store.Save(t)
+	return res, rn.r.comm().Save(t)
 }
 
 // StuckError stops a task whose agent is going in circles, before it
@@ -721,7 +721,7 @@ func (rn *run) sequential(ctx context.Context) error {
 			}
 			t.Round++
 		}
-		if err := rn.r.Store.Save(t); err != nil {
+		if err := rn.r.comm().Save(t); err != nil {
 			return err
 		}
 		if allDone(t) {
@@ -813,7 +813,7 @@ func (rn *run) parallel(ctx context.Context) error {
 		}
 		t.Round++
 		t.Note = ""
-		if err := rn.r.Store.Save(t); err != nil {
+		if err := rn.r.comm().Save(t); err != nil {
 			return err
 		}
 	}

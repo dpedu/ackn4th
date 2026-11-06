@@ -51,6 +51,27 @@ Agents run on your existing plans through their CLIs (**Claude Code**,
 > costs and following each provider's terms are up to you. [Spending caps](#keeping-costs-in-check)
 > help keep that in check.
 
+## What you get: one loop, and a choice of where it runs
+
+`ackn4th` gives you a small team of software-development roles — a product
+manager, one or more developers, a reviewer, QA — that works a task in your
+checkout until they agree it is done:
+
+1. **You describe the task.** A prompt, a GitHub issue, or a form in the
+   dashboard.
+2. **The roles take turns** (or all work at once) in your project: they read
+   the code, run commands, edit files and explain themselves as they go.
+3. **They review each other**, keep shared notes on the project, and hand work
+   between roles until nothing is left to fix.
+4. **You review the result**: every turn, file change and handoff is on
+   record in the dashboard, and the task stops resumably whenever you want.
+
+That loop is the product. What is new is **where it can run**: the same loop,
+with the same commands and the same dashboard, on **your machine** — or on an
+**AI server you own**, with the controller serving task state over gRPC so your
+laptop can follow, start and stop the work from anywhere. Nothing about the loop
+changes between the two; only where its state lives.
+
 ## Is it for you?
 
 **What it's for**
@@ -238,6 +259,63 @@ A task that reaches a cap stops, resumably, and says which cap it hit;
 shows each task's (`≈$1.23 of $5.00`). How it works:
 [spending caps](internal/task/README.md#spending-caps).
 
+## Choosing where task state lives
+
+Everything a task needs to be followed and driven — its record, its event log,
+its run markers, the streaming previews — goes through one interface,
+[`task.Backend`](internal/task/backend.go). There is **one implementation** of
+it — the gRPC client — reached two ways: **local**, where this process serves
+its own data dir over a private unix socket, and **controller**, where it dials
+a daemon on another machine. So every command takes the same code path for task
+state whichever one is live, and the two cannot drift apart. **You choose where
+state lives when you install it.** Both run the same agent loop with the same
+commands and the same dashboard.
+
+| Where | Chosen by | State lives in | Reach for it when |
+| --- | --- | --- | --- |
+| **local** — the default | nothing to set | this machine's data dir, served in-process | you work on one machine; no setup, nothing to expose |
+| **controller** | `ACKN4TH_BACKEND_URL` | the controller's data dir, on that host | the CLI should follow and control tasks running on another machine |
+
+**Local is the default, and it stays the default.** With no configuration at
+all, task state is files under the data dir, exactly as it always has been — the
+socket that carries it is a unix socket in a private directory, so nothing is
+exposed to the network and nothing local is readable by another user.
+
+**The controller is the same model, in a shared place.** The daemon keeps the
+same files a local run uses — `task.json`, the event log, `summary.md`, the live
+previews — under its own data dir, and serves them over a small gRPC interface.
+What that buys you is the thing files cannot do: **a CLI on another machine
+reading and driving the same task**, including the files a run leaves behind.
+
+```sh
+# the default: same machine, files under the data dir
+ackn4th start-task -d "Add rate limiting"
+
+# or: point at the controller so any machine sees the same tasks
+export ACKN4TH_BACKEND_URL=ackn://tasks.internal:7687
+ackn4th list-tasks
+```
+
+`ackn4th status` shows which backend is live and where its state actually is —
+this machine's data dir, or the controller's address.
+
+## Running the daemon on another host
+
+The tasks run on a server with the checkouts and the provider credentials, and
+your laptop watches and steers them.
+
+```sh
+# on the host with the workspaces and the keys
+ACKN4TH_BACKEND_URL=ackn://0.0.0.0:7687 ackn4th controller
+```
+
+It carries out `start-task`, `resume-task` and `stop-task` from anywhere, so
+nothing signals a process on the wrong machine. Everything that never leaves the
+runner's host — agent conversations, snapshots, scratch dirs, run logs, the spend
+ledger — stays there. What the interface is, what runs where, streaming, and the
+trust boundary (the port is unauthenticated):
+[the controller's gRPC interface](docs/grpc-backend.md).
+
 ## Documentation
 
 Each topic lives next to the code it describes:
@@ -245,6 +323,7 @@ Each topic lives next to the code it describes:
 | Topic | Where | Code |
 | --- | --- | --- |
 | Commands, flags, scripts and CI | [internal/cli/README.md](internal/cli/README.md) | `internal/cli/` |
+| Running the daemon on another host | [docs/grpc-backend.md](docs/grpc-backend.md) | `internal/task/` (`backend.go`, `grpc.go`) |
 | Providers, sign-in, choosing models | [internal/provider/README.md](internal/provider/README.md) | `internal/provider/`, `internal/auth/` |
 | How a task runs: turns, parallel, shared context, onboarding | [internal/task/README.md](internal/task/README.md) | `internal/task/`, `internal/agent/`, `internal/onboard/` |
 | The dashboard | [internal/dash/README.md](internal/dash/README.md) | `internal/dash/` |

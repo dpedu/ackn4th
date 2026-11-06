@@ -126,6 +126,11 @@ type Task struct {
 	FollowUps []FollowUp `json:"follow_ups,omitempty"`
 	// Todos are what the agents need from the person who gave the task.
 	Todos []Todo `json:"todos,omitempty"`
+	// Repo is the GitHub repository the task works in (--repo, owner/name),
+	// when one was named. The clone happens on the host that runs the task -
+	// its disk, its gh login - so the record has to say which repository, not
+	// just where the clone is meant to land.
+	Repo string `json:"repo"`
 	// Branch is the git branch the task works on (--branch), checked out
 	// or created when it started.
 	Branch string `json:"branch,omitempty"`
@@ -225,12 +230,22 @@ func (t *Task) Resumable() bool {
 }
 
 // Store reads and writes tasks under a root directory.
-type Store struct{ Root string }
+type Store struct {
+	Root string
+	// data is the data dir this store was opened with. Root is where the
+	// tasks live inside it; keeping both means a command can name the data
+	// dir the person configured without re-deriving it from Root.
+	data string
+}
 
 // NewStore returns a store rooted at dataDir/tasks.
-func NewStore(dataDir string) *Store { return &Store{Root: filepath.Join(dataDir, "tasks")} }
+func NewStore(dataDir string) *Store {
+	return &Store{Root: filepath.Join(dataDir, "tasks"), data: dataDir}
+}
 
-// Dir is a task's directory.
+// Dir is a task's directory. It joins, it does not check: every method that
+// takes an ID from outside calls checkID first, so a path built here cannot
+// leave Root.
 func (s *Store) Dir(id string) string { return filepath.Join(s.Root, id) }
 
 func (s *Store) taskPath(id string) string   { return filepath.Join(s.Dir(id), "task.json") }
@@ -266,6 +281,83 @@ func (s *Store) DataDir() string { return filepath.Dir(s.Root) }
 // ends: the outcome, what each agent reported and the to-dos.
 func (s *Store) SummaryPath(id string) string { return filepath.Join(s.Dir(id), "summary.md") }
 
+// The run files a client can read back over the controller's interface. They
+// are named here rather than derived from a request: a task's directory also
+// holds its record, its event log, agent conversations and scratch dirs.
+const (
+	SummaryFile = "summary.md"
+	GitHubFile  = "github.md"
+	BriefFile   = "brief.md"
+)
+
+// ArtifactNames lists the files Artifact serves, by their own names.
+var ArtifactNames = []string{SummaryFile, GitHubFile, BriefFile}
+
+// artifactFiles maps every accepted spelling to the file it names. The short
+// spelling is accepted because that is what the thing is called when a person
+// asks for it - "the summary", not "summary.md" - and the extension is the
+// store's business. Nothing here is a path: the value is chosen from this map,
+// never built from the request.
+var artifactFiles = map[string]string{
+	"summary": SummaryFile, SummaryFile: SummaryFile,
+	"github": GitHubFile, GitHubFile: GitHubFile,
+	"brief": BriefFile, BriefFile: BriefFile,
+}
+
+// ErrNoArtifact means the task has no such run file: a name outside
+// ArtifactNames, or one no run has written yet. A reader shows nothing for it.
+var ErrNoArtifact = errors.New("no such task artifact")
+
+// ArtifactPath names one of the allowlisted run files of task id, and refuses
+// everything else. Both halves are client strings on the controller's port, so
+// both are checked here: the name against the list, the id by checkID, and the
+// answer against the task's own directory - one file inside it, never a path
+// that climbs out of it.
+func (s *Store) ArtifactPath(id, name string) (string, error) {
+	if err := checkID(id); err != nil {
+		return "", err
+	}
+	file, ok := artifactFiles[name]
+	if !ok {
+		return "", fmt.Errorf("%w: %q (a task has %s)", ErrNoArtifact, name, strings.Join(ArtifactNames, ", "))
+	}
+	p := filepath.Join(s.Dir(id), file)
+	// Neither input can be a path any more, and this says so out loud rather
+	// than relying on the two checks agreeing for ever.
+	if filepath.Clean(filepath.Dir(p)) != filepath.Clean(s.Dir(id)) {
+		return "", fmt.Errorf("%w: %q", ErrNoArtifact, name)
+	}
+	return p, nil
+}
+
+// Artifact reads one of the files ArtifactPath serves. The text comes back as
+// it was written: these are Markdown documents, and a client on another machine
+// shows them rather than opening a path it does not have.
+//
+// A refusal names the task and the artifact, never a directory: the path is the
+// daemon's layout, and a client cannot open it anyway.
+func (s *Store) Artifact(id, name string) (string, error) {
+	p, err := s.ArtifactPath(id, name)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("%w: %s has no %s yet", ErrNoArtifact, id, name)
+	}
+	if err != nil {
+		// This error can reach a client on another machine, which cannot open
+		// the file and has no business being told where the daemon keeps it, so
+		// the path goes: the artifact's name and the cause stay.
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return "", fmt.Errorf("read the task's %s: %w", name, err)
+	}
+	return string(data), nil
+}
+
 // ScratchPath is agent n's (0-based) private directory for its commands:
 // their HOME, TMPDIR and caches.
 func (s *Store) ScratchPath(id string, n int) string {
@@ -286,10 +378,42 @@ func NewID() string {
 	return string(b)
 }
 
+// checkID rejects an ID that cannot name a task. Both backends use it: the
+// file store joins the ID onto its tasks root, so a separator would let a
+// caller read, write or delete outside the data dir, so a separator would let
+// them walk out of it.
+//
+// IDs come from NewID's safe alphabet. Everything else has to be refused here
+// because this is a boundary of its own: a gRPC caller reaches these methods
+// without passing through the CLI's checks, and the controller's port is not
+// authenticated.
+func checkID(id string) error {
+	if id == "" {
+		return errors.New("no task given")
+	}
+	if id == "." || id == ".." || strings.ContainsAny(id, ":\\/ \r\n\t\x00") {
+		return fmt.Errorf("invalid task id %q", id)
+	}
+	return nil
+}
+
 // Create persists a new task.
-func (s *Store) Create(t *Task) error {
+func (s *Store) Create(t *Task) error { return s.CreateWithBrief(t, "") }
+
+// CreateWithBrief is Create plus the GitHub context the task's brief starts
+// from. The context is written first, so a task that exists always has the
+// brief it was created with, whichever host fetched it.
+func (s *Store) CreateWithBrief(t *Task, github string) error {
+	if err := checkID(t.ID); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Join(s.Dir(t.ID), "agents"), 0o700); err != nil {
 		return err
+	}
+	if github != "" {
+		if err := writeAtomic(s.GitHubPath(t.ID), []byte(github)); err != nil {
+			return err
+		}
 	}
 	now := time.Now().UTC()
 	t.CreatedAt, t.UpdatedAt = now, now
@@ -306,6 +430,9 @@ func (s *Store) Create(t *Task) error {
 
 // Save writes the task atomically.
 func (s *Store) Save(t *Task) error {
+	if err := checkID(t.ID); err != nil {
+		return err
+	}
 	t.UpdatedAt = time.Now().UTC()
 	data, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
@@ -316,6 +443,9 @@ func (s *Store) Save(t *Task) error {
 
 // Load reads a task by exact ID.
 func (s *Store) Load(id string) (*Task, error) {
+	if err := checkID(id); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(s.taskPath(id))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("no task %q (see `ackn4th list-tasks`)", id)
@@ -417,7 +547,7 @@ func (s *Store) List() ([]*Task, error) {
 // (crash, kill -9, reboot): if it claims to be running but nobody holds
 // its lock, it is marked failed so it can be resumed.
 func (s *Store) Reconcile(t *Task) {
-	if t.Status == Running && !s.Locked(t.ID) {
+	if locked, err := s.Locked(t.ID); t.Status == Running && err == nil && !locked {
 		t.Status = Failed
 		t.Reason = "runner exited unexpectedly"
 		t.PID = 0
@@ -427,6 +557,9 @@ func (s *Store) Reconcile(t *Task) {
 
 // AppendEvent adds an event to the task's log.
 func (s *Store) AppendEvent(id string, e event.Event) error {
+	if err := checkID(id); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(s.eventsPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
@@ -443,6 +576,9 @@ func (s *Store) AppendEvent(id string, e event.Event) error {
 // ReadEvents returns events starting at byte offset off, and the offset
 // just past the last complete line read.
 func (s *Store) ReadEvents(id string, off int64) ([]event.Event, int64, error) {
+	if err := checkID(id); err != nil {
+		return nil, off, err
+	}
 	f, err := os.Open(s.eventsPath(id))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, off, nil
@@ -476,7 +612,12 @@ func (s *Store) ReadEvents(id string, off int64) ([]event.Event, int64, error) {
 // turn is briefed like a first one, with the task and the notes. The
 // workspace, the notes and the task's history stay. The caller saves t.
 func (s *Store) Switch(t *Task, n int, provider, model, effort string) error {
-	if s.Locked(t.ID) {
+	if err := checkID(t.ID); err != nil {
+		return err
+	}
+	if locked, err := s.Locked(t.ID); err != nil {
+		return err
+	} else if locked {
 		return fmt.Errorf("task %s is running: stop it first", t.ID)
 	}
 	for _, p := range []string{s.AgentStatePath(t.ID, n), s.SnapshotPath(t.ID, n)} {
@@ -494,13 +635,24 @@ func (s *Store) Switch(t *Task, n int, provider, model, effort string) error {
 
 // Delete removes a task's records (never its workspace).
 func (s *Store) Delete(id string) error {
-	if s.Locked(id) {
+	if err := checkID(id); err != nil {
+		return err
+	}
+	if locked, err := s.Locked(id); err != nil {
+		return err
+	} else if locked {
 		return fmt.Errorf("task %s is running: stop it first", id)
 	}
 	return os.RemoveAll(s.Dir(id))
 }
 
 func writeAtomic(path string, data []byte) error {
+	// The task's record may live in a shared backend, in which case nothing
+	// has created this host's copy of its directory yet (agent state and
+	// snapshots are written here the first time a remote runner works).
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err

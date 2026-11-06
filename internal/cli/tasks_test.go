@@ -128,8 +128,9 @@ func TestChangeTeam(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	a := &app{cfg: config.Default(), store: task.NewStore(t.TempDir())}
-	tk := &task.Task{Prompt: "p", Workspace: t.TempDir(), Status: task.Completed, Agents: []task.AgentSpec{
+	st := task.NewStore(t.TempDir())
+	a := &app{cfg: config.Default(), be: st, store: st}
+	tk := &task.Task{ID: task.NewID(), Prompt: "p", Workspace: t.TempDir(), Status: task.Completed, Agents: []task.AgentSpec{
 		{Role: "backend_dev", Provider: "claude", Model: "claude-opus-5-5", Effort: "high"},
 		{Role: "qa_engineer", Provider: "claude", Model: "claude-opus-5-5", Effort: "high"},
 	}}

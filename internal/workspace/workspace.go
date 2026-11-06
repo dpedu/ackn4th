@@ -138,6 +138,13 @@ func (w *Workspace) hide(abs string, err error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return
 	}
+	// When the sandbox home is the workspace itself (ACKN4TH_HOME with the
+	// data and config dirs inside it), rel is ".": hiding it would hide
+	// every path in the workspace. config and data are hidden by their own
+	// names below.
+	if rel == "." {
+		return
+	}
 	w.hidden = append(w.hidden, filepath.ToSlash(rel))
 }
 

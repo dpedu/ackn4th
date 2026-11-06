@@ -203,6 +203,35 @@ func TestAckn4thDirsHidden(t *testing.T) {
 	}
 }
 
+// A sandbox whose home IS the workspace (ACKN4TH_HOME pointing at the
+// directory the agents work in) must not hide every path in it: hiding
+// the root turned read_file into "does not exist" and write_file into
+// "belongs to ackn4th" for the whole tree. Its config and data dirs are
+// hidden by name instead.
+func TestSandboxHomeAtWorkspaceRoot(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ACKN4TH_HOME", dir)
+	os.MkdirAll(filepath.Join(dir, "config"), 0o700)
+	os.WriteFile(filepath.Join(dir, "config", "oauth.json"), []byte("grant"), 0o600)
+	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
+	os.WriteFile(filepath.Join(dir, "sub", "main.go"), []byte("package main\n"), 0o644)
+
+	ws, err := Open(dir, []string{"**"}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if b, err := ws.ReadFile("sub/main.go", 0, 0); err != nil || !strings.Contains(b, "package main") {
+		t.Fatalf("reading an ordinary file when the sandbox home is the workspace: %q, %v", b, err)
+	}
+	if err := ws.WriteFile("sub/other.go", "package main\n"); err != nil {
+		t.Fatalf("writing an ordinary file when the sandbox home is the workspace: %v", err)
+	}
+	if _, err := ws.ReadFile("config/oauth.json", 0, 0); err == nil {
+		t.Fatal("ackn4th's config is readable from the workspace root")
+	}
+}
+
 func TestSandboxHomeAlwaysHidden(t *testing.T) {
 	dir := t.TempDir() // no ACKN4TH_HOME: a normal install working on the repo
 	os.MkdirAll(filepath.Join(dir, "sandbox", HomeDirName, "config"), 0o700)

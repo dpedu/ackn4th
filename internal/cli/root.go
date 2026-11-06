@@ -32,6 +32,8 @@ import (
 	"github.com/dethmasque/ackn4th/internal/tips"
 	"github.com/dethmasque/ackn4th/internal/tools"
 	"github.com/dethmasque/ackn4th/internal/ui"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Version is set at build time with -ldflags "-X github.com/dethmasque/ackn4th/internal/cli.Version=v1.2.3".
@@ -46,8 +48,18 @@ func init() {
 
 // app carries what every command needs.
 type app struct {
-	cfg   config.Config
-	term  *ui.Term
+	cfg  config.Config
+	term *ui.Term
+	// be is the one backend this process uses: the gRPC client either way,
+	// pointed at this process's own unix socket or at a controller.
+	// It is chosen once, by task.OpenBackend in load, and never re-decided:
+	// no command asks which one it has except through the capability
+	// interfaces (Shared, Controller, ConfigSharer).
+	be task.Backend
+	// store is this machine's own files: run logs, summaries, clones, scratch
+	// dirs, the run lock. With the local endpoint it is the store that
+	// endpoint serves; on a client it is still where this host keeps the
+	// artifacts that never leave it. It is not a second channel to task state.
 	store *task.Store
 	noFX  bool
 	speak bool // --voice on bare ackn4th
@@ -61,6 +73,10 @@ type app struct {
 	tips *tips.Book
 	// ledger records spending for every runner, in the data dir.
 	ledger *spend.Ledger
+	// cfgSource says which machine's settings a.cfg holds, and cfgWarning
+	// why the controller's could not be adopted.
+	cfgSource  string
+	cfgWarning string
 }
 
 func (a *app) load() error {
@@ -74,10 +90,105 @@ func (a *app) load() error {
 	if err != nil {
 		return err
 	}
-	a.store = task.NewStore(data)
+	// One choice, made here and nowhere else. Assign only after a successful
+	// open: a backend that failed to open is not one to close later, and
+	// nothing may treat it as the live channel.
+	be, err := task.OpenBackend(data)
+	if err != nil {
+		return err
+	}
+	a.be = be
+	// The store for this host's own files comes from the backend: the store a
+	// local endpoint serves, or, on a client, this machine's data dir for the
+	// artifacts that never leave it. Taking it from there rather than opening
+	// a second one keeps a single view of the same directory, so a log a
+	// runner writes is the one the backend can read back.
+	if h, ok := be.(task.HostStore); ok {
+		a.store = h.HostStore()
+	} else {
+		// A backend that keeps its state entirely elsewhere still gets a data
+		// dir for this host's files; no shipped backend is in this case.
+		a.store = task.NewStore(data)
+	}
 	a.ledger = &spend.Ledger{Dir: filepath.Join(data, "spend")}
 	a.tips = tips.Load(data, cfg.Tips)
+	a.adoptSharedConfig()
 	return nil
+}
+
+// cfgSource names where a.cfg's task-affecting settings came from, so a
+// command can say which machine's file is in effect.
+const (
+	cfgFromLocal      = "local"
+	cfgFromController = "controller"
+)
+
+// adoptSharedConfig takes the daemon's settings when the tasks run on another
+// machine. They are the ones the run will actually use - its providers, models,
+// limits and workspace roots - so a client applying its own file would offer
+// models the daemon cannot run, show workspace roots that exist only on the
+// laptop, and refuse paths the daemon accepts.
+//
+// Nothing is written to disk: the pulled settings live in a.cfg for this
+// process, so a client never creates or edits a config.yaml it does not own.
+// With no controller answering there is nothing to adopt and the local file
+// stands in, which is what lets a person see their own settings while the
+// daemon is down.
+func (a *app) adoptSharedConfig() {
+	a.cfgSource = cfgFromLocal
+	s, ok := a.backend().(task.ConfigSharer)
+	if !ok {
+		return
+	}
+	text, found, err := s.SharedConfig()
+	if err != nil {
+		// "Nothing published" is normal and silent; "could not read" is not:
+		// the person is then editing settings that are not the ones in use.
+		a.cfgWarning = "could not read the controller's settings (" + err.Error() + "); using this machine's config"
+		return
+	}
+	if !found {
+		return
+	}
+	var shared config.Config
+	if err := yaml.Unmarshal([]byte(text), &shared); err != nil {
+		a.cfgWarning = "the controller published settings this build cannot read (" + err.Error() + "); using this machine's config"
+		return
+	}
+	a.cfg.WorkspaceRoots = shared.WorkspaceRoots
+	a.cfg.DefaultWorkspaceRoot = shared.DefaultWorkspaceRoot
+	if shared.DefaultProvider != "" {
+		a.cfg.DefaultProvider = shared.DefaultProvider
+	}
+	if len(shared.Providers) > 0 {
+		a.cfg.Providers = shared.Providers
+	}
+	if len(shared.Agents) > 0 {
+		a.cfg.Agents = shared.Agents
+	}
+	a.cfg.Limits = shared.Limits
+	a.cfgSource = cfgFromController
+}
+
+// backend is the one task.Backend this process uses. It is an accessor, not a
+// decision: load picked the implementation through task.OpenBackend, and there
+// is deliberately no "fall back to the store when nil" branch - that branch is
+// a second, silent selection, and it is how a configured controller once ended
+// up ignored while everything still compiled.
+func (a *app) backend() task.Backend { return a.be }
+
+// remote reports whether task state lives on a controller
+// rather than this machine's data dir: a daemon elsewhere owns the
+// process that runs the task.
+//
+// It asks the backend through task.Shared, never by type-switching on which
+// one was chosen: reading nil-ness as "remote" once made every local start and
+// stop route to a controller that cannot exist.
+func (a *app) remote() bool {
+	if s, ok := a.backend().(task.Shared); ok {
+		return s.Shared()
+	}
+	return false
 }
 
 func (a *app) roles() (*role.Registry, error) {
@@ -185,8 +296,16 @@ func (a *app) runner() (*task.Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A runner always talks to the local store, never to the controller that
+	// started it. A task runs on the host that owns its data directory, so
+	// that directory is where the runner's records, events and heartbeat
+	// belong; going out over gRPC to the very process that spawned it would
+	// make a controller restart - or a moment without network - abort every
+	// task in flight with "runner exited unexpectedly". Store.Spawn also
+	// strips the endpoint from the runner's environment, so `__run` opens the
+	// same local store.
 	r := &task.Runner{
-		Store: a.store, Roles: roles, NewProvider: a.providerFor, AllowedRoots: allowed,
+		Store: a.store, Comm: a.store, Roles: roles, NewProvider: a.providerFor, AllowedRoots: allowed,
 		Commands: cmds, Hide: hide,
 		MaxSteps: a.cfg.Limits.MaxStepsPerTurn, MaxFileBytes: a.cfg.Limits.MaxFileBytes,
 		// Checked before every model request, so signing out of a
@@ -227,7 +346,15 @@ func (a *app) commandPolicy() (*tools.CommandPolicy, []string, error) {
 
 // requireSignedIn fails unless every provider is signed in, naming each
 // one that isn't. The sandbox's mock provider needs no sign-in.
+// requireSignedIn checks that this machine can make a model request. Where a
+// controller runs the task it cannot be this machine's business: the daemon
+// holds the key, and its runner calls auth.StillHeld before every request, so
+// a local check here protects nothing and only stops a laptop without a key
+// from starting a task the server is set up to run.
 func (a *app) requireSignedIn(providers ...string) error {
+	if a.remote() {
+		return nil
+	}
 	real := slices.DeleteFunc(slices.Clone(providers), func(p string) bool { return p == "mock" })
 	return auth.Require(real...)
 }
@@ -293,8 +420,9 @@ your own accounts and under each provider's terms. MIT licensed, no warranty.`,
 		listTasksCmd(a), showTaskCmd(a), renameTaskCmd(a), deleteTaskCmd(a),
 		notesCmd(a), briefCmd(a), trustCmd(a), untrustCmd(a),
 		loginCmd(a), statusCmd(a), logoutCmd(a),
-		rolesCmd(a), configCmd(a), spendCmd(a), walkthroughCmd(a), openPRCmd(a), voiceCmd(a), disableTipsCmd(a), enableTipsCmd(a), versionCmd(), internalRunCmd(a),
+		rolesCmd(a), configCmd(a), spendCmd(a), walkthroughCmd(a), openPRCmd(a), voiceCmd(a), disableTipsCmd(a), enableTipsCmd(a), versionCmd(), internalRunCmd(a), controllerCmd(a),
 	)
+	defer a.closeComm()
 	if cmd, err := root.ExecuteContextC(ctx); err != nil {
 		if !errors.Is(err, errReported) {
 			printError(ui.NewTerm(os.Stderr, false), cmd, err)
@@ -302,6 +430,14 @@ your own accounts and under each provider's terms. MIT licensed, no warranty.`,
 		return 1
 	}
 	return 0
+}
+
+// closeComm releases the backend this process opened. It is the one resource
+// load acquires, so it is the one thing a command must hand back.
+func (a *app) closeComm() {
+	if a.be != nil {
+		a.be.Close()
+	}
 }
 
 func versionCmd() *cobra.Command {

@@ -148,6 +148,12 @@ func (m *model) footer() string {
 		return fill(" "+chip("y ⏎", "yes")+chip("n esc", "no")+chip("←→", "choose"), m.w, bg0)
 	case m.failed != "":
 		return fill(" "+pill("✗", red, bg0)+" "+pRed(oneLine(m.failed))+pDim("  · any key dismisses"), m.w, bg0)
+	case m.err != nil:
+		// The backend could not be read - usually a controller that is not
+		// answering. Say it on the first frame instead of showing an empty
+		// dashboard as if this host had no tasks (R67); it clears on the first
+		// poll that answers.
+		return fill(" "+pill("!", amber, bg0)+" "+pAmber(oneLine(m.err.Error()))+pDim("  · retrying"), m.w, bg0)
 	case m.flash != "" && time.Since(m.flashAt) < 4*time.Second:
 		return fill(" "+pAmber("▸ ")+pText(m.flash), m.w, bg0)
 	}

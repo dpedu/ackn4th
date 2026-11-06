@@ -60,7 +60,7 @@ type Agent struct {
 const liveFresh = 90 * time.Second
 
 // readLive refreshes each working agent's live view from the runner.
-func (l *Live) readLive(s *task.Store) {
+func (l *Live) readLive(s task.Backend) {
 	for i, a := range l.Agents {
 		a.Live = nil
 		if a.Phase == Idle || l.Task.Status != task.Running {

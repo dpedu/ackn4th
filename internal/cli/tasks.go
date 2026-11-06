@@ -18,7 +18,6 @@ import (
 
 	"github.com/dethmasque/ackn4th/internal/config"
 	"github.com/dethmasque/ackn4th/internal/event"
-	"github.com/dethmasque/ackn4th/internal/github"
 	"github.com/dethmasque/ackn4th/internal/provider/claudecode"
 	"github.com/dethmasque/ackn4th/internal/provider/openai"
 	"github.com/dethmasque/ackn4th/internal/task"
@@ -402,6 +401,11 @@ func (a *app) chooseRoles(err error, title string, multi bool) ([]string, error)
 
 // launch validates a new task, creates it, and runs it.
 func (a *app) launch(ctx context.Context, f *runFlags, args []string, reqs []agentReq) error {
+	if a.remote() {
+		if err := remoteVCSErr(f.branch, f.draftPR); err != nil {
+			return err
+		}
+	}
 	prompt, err := f.readPrompt(args)
 	if errors.Is(err, errNoPrompt) {
 		prompt, err = a.ask(err, "what should the agents do?", nil)
@@ -426,7 +430,7 @@ func (a *app) launch(ctx context.Context, f *runFlags, args []string, reqs []age
 		return err
 	}
 	if f.draftPR {
-		if err := github.CheckPR(ctx, dir); err != nil {
+		if err := a.checkDraftPR(ctx, dir); err != nil {
 			return fmt.Errorf("--draft-pr: %w", err)
 		}
 	}
@@ -444,18 +448,18 @@ func (a *app) launch(ctx context.Context, f *runFlags, args []string, reqs []age
 	case rounds < 0:
 		rounds = a.cfg.Limits.MaxRounds
 	}
-	tk := &task.Task{ID: id, Name: name, Prompt: prompt, Workspace: dir, Agents: agents, MaxRounds: rounds, MaxCost: f.maxCost, DraftPR: f.draftPR, Branch: f.branch}
+	tk := &task.Task{ID: id, Name: name, Prompt: prompt, Workspace: dir, Repo: f.repo, Agents: agents, MaxRounds: rounds, MaxCost: f.maxCost, DraftPR: f.draftPR, Branch: f.branch}
 	if f.parallel {
 		if len(agents) < 2 {
 			return errors.New("--parallel needs at least two agents")
 		}
 		tk.Mode = task.ModeParallel
 	}
-	if err := a.store.Create(tk); err != nil {
+	ghContext, err := a.githubBrief(ctx, prompt, false)
+	if err != nil {
 		return err
 	}
-	if err := a.fetchGitHub(ctx, tk, false); err != nil {
-		a.store.Delete(tk.ID)
+	if err := a.createTask(tk, ghContext); err != nil {
 		return err
 	}
 	a.term.Banner()
@@ -546,6 +550,9 @@ func (a *app) taskWorkspace(ctx context.Context, f *runFlags, id string) (string
 	if err != nil {
 		return "", err
 	}
+	if a.remote() {
+		return a.remoteWorkspace(ctx, f, id, allowed)
+	}
 	switch {
 	case (f.scratch && f.workspace != "") || (f.repo != "" && (f.scratch || f.workspace != "")):
 		return "", errors.New("use one of --workspace, --scratch and --repo")
@@ -568,10 +575,113 @@ func (a *app) taskWorkspace(ctx context.Context, f *runFlags, id string) (string
 	return resolved, err
 }
 
+// remoteWorkspace resolves a workspace for a task that will run on another
+// machine. That host owns the workspace: it checks the path against its own
+// roots, clones the repository and enforces the trust boundary when the runner
+// starts, so this is naming where the work happens, not deciding whether it
+// may.
+//
+// Applying this machine's policy instead was wrong in both directions. It
+// refused directories the daemon accepts, with advice - `ackn4th trust` - that
+// edits *this* machine's config.yaml, a file the daemon never reads, so the
+// task started, spawned a runner, and then failed with a second, contradictory
+// message. And it created a clone here, on a disk no runner can see.
+func (a *app) remoteWorkspace(ctx context.Context, f *runFlags, id string, allowed []string) (string, error) {
+	switch {
+	case (f.scratch && f.workspace != "") || (f.repo != "" && (f.scratch || f.workspace != "")):
+		return "", errors.New("use one of --workspace, --scratch and --repo")
+	case f.scratch && f.branch != "":
+		return "", errors.New("--branch needs a git workspace: use it with --repo or --workspace, not --scratch")
+	case f.repo != "":
+		// The same function the controller uses to decide where to clone, so a
+		// task cannot name one directory here and be made in another there.
+		return a.repoPath(f.repo, allowed)
+	case f.scratch:
+		if len(allowed) == 0 {
+			return "", fmt.Errorf("the daemon published no workspace roots, so --scratch has nowhere to go: set one on the host that runs the tasks")
+		}
+		return filepath.Join(allowed[0], id), nil
+	}
+	// "Wherever I am on this machine" is not a place on that machine. Without
+	// this, `start-task -d "..."` run from ~/proj created a task whose workspace
+	// was /Users/you/proj on the controller, and the runner there refused it
+	// with "not a trusted directory (trust it with ackn4th trust /Users/you/…)"
+	// - advice that rewrites the laptop's config, which the daemon never reads.
+	// The daemon publishes the answer in the same Config RPC this client
+	// already adopts.
+	//
+	// Only the daemon's value counts. a.cfg.DefaultWorkspaceRoot is this
+	// machine's own whenever nothing was adopted - a daemon with no config.yaml
+	// publishes nothing, and one that was unreachable while the client loaded
+	// leaves the local file standing in - so trusting it unconditionally sends
+	// a laptop path and fails exactly as R65 did.
+	root := ""
+	if a.cfgSource == cfgFromController {
+		root = a.cfg.DefaultWorkspaceRoot
+	}
+	if f.workspace == "" {
+		if root == "" {
+			return "", noRootErr(a.cfgWarning)
+		}
+		return root, nil
+	}
+	if !filepath.IsAbs(f.workspace) {
+		if root == "" {
+			if a.cfgWarning != "" {
+				return "", fmt.Errorf("--workspace %q is relative, and a relative path only means something once the controller's root is known, which it is not: %s", f.workspace, a.cfgWarning)
+			}
+			return "", fmt.Errorf("--workspace %q is relative, and a path is only meaningful on the machine that runs the task: pass an absolute one, or set default_workspace_root on the controller", f.workspace)
+		}
+		return filepath.Join(root, f.workspace), nil
+	}
+	return absolutePath(f.workspace)
+}
+
+// noRootErr says why there is no workspace to name, and only claims the
+// controller published nothing when that is what happened. A client that could
+// not read the settings knows it - adoptSharedConfig leaves a cfgWarning - and
+// telling that person their daemon has no workspace root sends them to edit a
+// config.yaml that may well already have one; the advice they need is to run
+// the command again.
+func noRootErr(warning string) error {
+	if warning != "" {
+		return fmt.Errorf("no workspace given, and this command could not ask the controller where to work: %s - pass --workspace with a directory on the host that runs the tasks, or run it again once the controller answers", warning)
+	}
+	return errors.New("no workspace given, and the controller published no default_workspace_root: pass --workspace with a directory on the host that runs the tasks, or set default_workspace_root there")
+}
+
+// absolutePath resolves a path on this machine without requiring it to sit
+// under a trusted root: in remote mode the roots belong to the daemon.
+func absolutePath(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real, nil
+	}
+	// It may not exist here at all, which is fine: it exists where it runs.
+	return abs, nil
+}
+
 // preflight checks every distinct provider and model once before a task
 // starts, so a typo in a model name fails now rather than mid-task. With
 // show, a spinner runs while it checks.
+//
+// It does nothing in remote mode, and nothing verifies the models there: the
+// controller runs the task with its own key, and a bad model name shows up as a
+// failed first round rather than a refusal. Checking it here would need a
+// request that asks the daemon to verify, and there is not one yet.
 func (a *app) preflight(ctx context.Context, agents []task.AgentSpec, show bool) error {
+	if a.remote() {
+		// The process that runs the task is on another machine, and only it
+		// holds the credentials. Checking here would either fail on this
+		// machine's missing key - telling the reader to sign in where the
+		// call is never made - or spend a request the daemon owns, from a
+		// client that cannot run the task anyway. The controller verifies on
+		// start, where the keys and the model are.
+		return nil
+	}
 	t := a.term
 	checked := map[string]bool{}
 	for _, ag := range agents {
@@ -603,13 +713,16 @@ func (a *app) preflight(ctx context.Context, agents []task.AgentSpec, show bool)
 
 // detach hands the task to a background runner.
 func (a *app) detach(tk *task.Task) error {
-	t := a.term
-	pid, err := a.store.Spawn(tk.ID)
-	if err != nil {
+	if err := a.spawnRunner(context.Background(), tk.ID); err != nil {
 		return err
 	}
+	t := a.term
+	where := ""
+	if !a.localRunner() {
+		where = " ON THE DAEMON HOST"
+	}
 	t.Println()
-	t.Decode(fmt.Sprintf("  ▓▒░  %s (%s) RUNNING IN THE BACKGROUND (pid %d)", strings.ToUpper(tk.Title()), tk.ID, pid), func(s string) string { return t.Bold(t.Lime(s)) })
+	t.Decode(fmt.Sprintf("  ▓▒░  %s (%s) RUNNING IN THE BACKGROUND%s", strings.ToUpper(tk.Title()), tk.ID, where), func(s string) string { return t.Bold(t.Lime(s)) })
 	t.Println()
 	t.Println(t.Gray("  explore "), t.Lime("ackn4th dash "+tk.ID))
 	t.Println(t.Gray("  watch   "), t.Lime("ackn4th watch-task "+tk.ID))
@@ -622,11 +735,25 @@ func (a *app) detach(tk *task.Task) error {
 // runForeground runs a task in this process with live rendering. Ctrl-C
 // stops it cleanly; it can be resumed later.
 func (a *app) runForeground(ctx context.Context, id string) error {
+	if !a.localRunner() {
+		// There is no terminal on the daemon host to render into, and a
+		// runner here would race the one that owns the task: start it
+		// there and follow it from here.
+		if err := a.spawnRunner(ctx, id); err != nil {
+			return err
+		}
+		t := a.term
+		t.Println()
+		t.Println(t.Green("✓ "), "started on the daemon host", t.Gray(" ("+id+")"))
+		t.Println(t.Gray("  watch   "), t.Lime("ackn4th watch-task "+id))
+		t.Println(t.Gray("  stop    "), t.Lime("ackn4th stop-task "+id))
+		return nil
+	}
 	r, err := a.runner()
 	if err != nil {
 		return err
 	}
-	tk, err := a.store.Load(id)
+	tk, err := a.backend().Load(id)
 	if err != nil {
 		return err
 	}
@@ -650,13 +777,36 @@ func (a *app) runForeground(ctx context.Context, id string) error {
 	final, err := r.Run(ctx, id, false)
 	rend.Close()
 	if final != nil {
-		outcome(a.term, final, started, a.summaryFile(final.ID))
+		outcome(a.term, final, started, a.summaryOf(final.ID))
 		a.tip("first-task", "look back over every turn, file change and handoff with `ackn4th dash "+final.ID+"`; `ackn4th resume-task "+final.ID+"` continues a stopped task.")
 	}
 	if final != nil && final.Status == task.Failed {
 		return errors.New("task failed")
 	}
 	return err
+}
+
+// runnerGone reports whether the task's runner has exited, as the backend
+// that holds the task can see: its heartbeat is gone and its record no
+// longer says it is running. The pid in a shared backend belongs to the
+// daemon host, so a local lock says nothing about it — and an error from the
+// backend means liveness is unknown, which is not the same as gone.
+func (a *app) runnerGone(id string) bool {
+	locked, err := a.backend().Locked(id)
+	if err != nil || locked {
+		return false
+	}
+	tk, err := a.backend().Load(id)
+	if err != nil {
+		return false
+	}
+	// Reconcile on every poll, not once up front: a runner killed after
+	// writing its record leaves the status Running, and only a reconcile
+	// after its heartbeat is gone proves that run dead and corrects it. That
+	// is what makes a hard-killed runner count as stopped, so do not hoist
+	// this out of the loop.
+	a.backend().Reconcile(tk)
+	return tk.Status != task.Running
 }
 
 func stopTaskCmd(a *app) *cobra.Command {
@@ -679,25 +829,32 @@ its in-flight request and saves state; nothing done so far is lost, and
 			if err != nil {
 				return err
 			}
-			a.store.Reconcile(tk)
+			a.backend().Reconcile(tk)
 			if tk.Status != task.Running {
 				t.Println(t.Gray("task "+tk.Label()+" is not running: "), statusLabel(t, tk.Status))
 				return nil
 			}
-			if err := task.Signal(tk.PID); err != nil {
-				return fmt.Errorf("signal runner (pid %d): %w", tk.PID, err)
+			// A pid recorded in a shared backend belongs to whichever host
+			// ran the daemon, so the stop is carried out there.
+			if err := a.stopRunner(cmd.Context(), tk); err != nil {
+				return err
 			}
 			spin := t.NewPingPong()
 			spin.Start("ackn4th", tk.ID, "stopping")
 			deadline := time.Now().Add(wait)
-			for a.store.Locked(tk.ID) && time.Now().Before(deadline) {
+			stopped := false
+			for !stopped && time.Now().Before(deadline) {
 				time.Sleep(200 * time.Millisecond)
+				stopped = a.runnerGone(tk.ID)
+			}
+			if !stopped {
+				stopped = a.runnerGone(tk.ID) // one last look at the deadline
 			}
 			spin.Stop()
-			if a.store.Locked(tk.ID) {
-				return fmt.Errorf("runner (pid %d) has not stopped after %s", tk.PID, wait)
+			tk, _ = a.backend().Load(tk.ID)
+			if !stopped {
+				return fmt.Errorf("task %s is still %s after %s; its runner may still be stopping on the host that runs it", tk.ID, tk.Status, wait)
 			}
-			tk, _ = a.store.Load(tk.ID)
 			t.Println(t.Green("✓ "), "task ", t.Bold(tk.Title()), t.Gray(" ("+tk.ID+") "), statusLabel(t, tk.Status), t.Gray("  · resume with "), t.Lime("ackn4th resume-task "+tk.ID))
 			return nil
 		},
@@ -738,7 +895,7 @@ and the task's history carry over.`,
 			if err != nil {
 				return err
 			}
-			a.store.Reconcile(tk)
+			a.backend().Reconcile(tk)
 			if tk.Status == task.Running {
 				a.term.Println(a.term.Gray("task " + tk.Label() + " is already running; attaching (Ctrl-C detaches, the task keeps running)"))
 				return a.watch(cmd.Context(), tk.ID, true)
@@ -775,7 +932,7 @@ and the task's history carry over.`,
 			if note != "" {
 				tk.Note = note
 			}
-			if err := a.store.Save(tk); err != nil {
+			if err := a.backend().Save(tk); err != nil {
 				return err
 			}
 			a.term.Banner()
@@ -821,7 +978,7 @@ the agents agree, if that had no limit).`,
 			if err != nil {
 				return err
 			}
-			a.store.Reconcile(tk)
+			a.backend().Reconcile(tk)
 			prompt := ""
 			if len(args) > 1 {
 				prompt = args[1]
@@ -845,7 +1002,7 @@ the agents agree, if that had no limit).`,
 			if cmd.Flags().Changed("max-cost") {
 				tk.MaxCost = tk.Cost() + maxCost
 			}
-			if err := a.store.Save(tk); err != nil {
+			if err := a.backend().Save(tk); err != nil {
 				return err
 			}
 			a.term.Banner()
@@ -864,13 +1021,36 @@ the agents agree, if that had no limit).`,
 	return cmd
 }
 
-// summaryFile is the task's summary.md, if a run has written one.
-func (a *app) summaryFile(id string) string {
+// artifact reads one of a task's run files where it lives: on the controller
+// for a remote task, in this host's data dir otherwise. A backend without it is
+// remote in that sense - its runners run here, so the files are here too, and
+// it is not an Artifacts backend. A file no run has written yet comes back as
+// task.ErrNoArtifact.
+func (a *app) artifact(id, name string) (string, error) {
+	if a.remote() {
+		if as, ok := a.backend().(task.Artifacts); ok {
+			return as.Artifact(id, name)
+		}
+	}
+	return a.store.Artifact(id, name)
+}
+
+// summaryOf is the task's summary.md as this host can show it: the path when the
+// file is here, the text when it came from the controller. Empty when no run has
+// written one.
+func (a *app) summaryOf(id string) summaryView {
+	if a.remote() {
+		text, err := a.artifact(id, task.SummaryFile)
+		if err != nil {
+			return summaryView{}
+		}
+		return summaryView{text: strings.TrimRight(text, "\n")}
+	}
 	p := a.store.SummaryPath(id)
 	if _, err := os.Stat(p); err != nil {
-		return ""
+		return summaryView{}
 	}
-	return tildeHome(p)
+	return summaryView{path: tildeHome(p)}
 }
 
 // move is one agent changing provider.
@@ -927,13 +1107,13 @@ func (a *app) applySwitch(tk *task.Task, moves []move) error {
 		return nil
 	}
 	for _, m := range moves {
-		if err := a.store.Switch(tk, m.agent, m.provider, m.model, m.effort); err != nil {
+		if err := a.backend().Switch(tk, m.agent, m.provider, m.model, m.effort); err != nil {
 			return err
 		}
 	}
-	a.store.AppendEvent(tk.ID, event.Event{Kind: event.Notice, Time: time.Now(), Round: tk.Round,
+	a.backend().AppendEvent(tk.ID, event.Event{Kind: event.Notice, Time: time.Now(), Round: tk.Round,
 		Text: fmt.Sprintf("moved %d agent(s) to %s; they start fresh conversations (workspace and notes carry over)", len(moves), moves[0].provider)})
-	return a.store.Save(tk)
+	return a.backend().Save(tk)
 }
 
 func listTasksCmd(a *app) *cobra.Command {
@@ -951,7 +1131,7 @@ start of its ID.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t := a.term
-			tasks, err := a.store.List()
+			tasks, err := a.backend().List()
 			if err != nil {
 				return err
 			}
@@ -1007,7 +1187,7 @@ func showTaskCmd(a *app) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			a.store.Reconcile(tk)
+			a.backend().Reconcile(tk)
 			return a.watch(cmd.Context(), tk.ID, false)
 		},
 	}
@@ -1034,36 +1214,115 @@ func watchTaskCmd(a *app) *cobra.Command {
 
 // watch replays a task's events and, with follow set, keeps tailing them
 // until the task stops running.
-func (a *app) watch(ctx context.Context, id string, follow bool) error {
-	tk, err := a.store.Load(id)
-	if err != nil {
-		return err
-	}
-	t := a.term
-	header(t, tk)
-	rend := newRenderer(t, tk)
-	defer rend.Close()
+// watchRetry is how often a follower tries a read that failed, and watchGiveUp
+// how long it keeps trying before it reports the failure: long enough for a
+// controller restart, short enough that a task deleted under a watcher is not
+// hidden for ever.
+var (
+	watchRetry  = 500 * time.Millisecond
+	watchGiveUp = 2 * time.Minute
+)
 
+func (a *app) watch(ctx context.Context, id string, follow bool) error {
+	t := a.term
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	var off int64
+
+	// A read that fails because the controller is away is not the end of the
+	// view: a restart - an upgrade, a config edit, a redeploy - is routine, and
+	// the task survives it. This covers the *first* load too: somebody who
+	// types `watch-task` while the controller is coming back up, or a script
+	// that runs just after `systemctl restart`, should wait for the answer
+	// rather than get a transport error.
+	//
+	// Only ErrNoController is retried. Everything else is the daemon's own
+	// answer - "no task \"k3f9qz\"", "task is running: stop it first" - and
+	// retrying that would spin for two minutes on a task somebody deleted
+	// instead of saying so.
+	var downSince time.Time
+	closeView := func() {}
+	retryRead := func(err error) (again bool, stop error) {
+		if !errors.Is(err, task.ErrNoController) {
+			return false, err
+		}
+		now := time.Now()
+		if downSince.IsZero() {
+			downSince = now
+			t.Println(t.Amber("  ! "), inline(t, "lost the controller ("+err.Error()+"); reconnecting"))
+		} else if now.Sub(downSince) > watchGiveUp {
+			return false, fmt.Errorf("no controller for %s: %w", now.Sub(downSince).Round(time.Second), err)
+		}
+		select {
+		case <-ctx.Done():
+			closeView()
+			t.Println()
+			t.Println(t.Gray("detached; task " + id + " keeps running"))
+			return false, nil
+		case <-time.After(watchRetry):
+			return true, nil
+		}
+	}
+	var tk *task.Task
 	for {
-		events, next, err := a.store.ReadEvents(id, off)
+		var err error
+		tk, err = a.backend().Load(id)
+		if err == nil {
+			break
+		}
+		again, stopErr := retryRead(err)
+		if !again {
+			return stopErr
+		}
+	}
+	header(t, tk)
+	rend := newRenderer(t, tk)
+	closeView = rend.Close
+	defer rend.Close()
+
+	// A backend that can push events is followed live; otherwise
+	// the log is tailed by polling the data dir.
+	var stream <-chan event.Event
+	var stopStream func()
+	if s, ok := a.backend().(task.Streamer); ok && follow {
+		if ch, done, err := s.Subscribe(ctx, id, 0); err == nil {
+			stream, stopStream = ch, done
+			defer stopStream()
+		}
+	}
+	var off int64
+	streaming := stream != nil
+	for {
+		var err error
+		if !streaming {
+			events, next, err := a.backend().ReadEvents(id, off)
+			if err != nil {
+				again, stop := retryRead(err)
+				if !again {
+					return stop
+				}
+				continue
+			}
+			off = next
+			for _, e := range events {
+				rend.Handle(e)
+			}
+		}
+		tk, err = a.backend().Load(id)
 		if err != nil {
-			return err
+			again, stop := retryRead(err)
+			if !again {
+				return stop
+			}
+			continue
 		}
-		off = next
-		for _, e := range events {
-			rend.Handle(e)
+		if !downSince.IsZero() {
+			downSince = time.Time{}
+			t.Println(t.Gray("  reconnected"))
 		}
-		tk, err = a.store.Load(id)
-		if err != nil {
-			return err
-		}
-		a.store.Reconcile(tk)
+		a.backend().Reconcile(tk)
 		if !follow || tk.Status != task.Running {
 			rend.Close()
-			outcome(t, tk, time.Time{}, a.summaryFile(tk.ID))
+			outcome(t, tk, time.Time{}, a.summaryOf(tk.ID))
 			return nil
 		}
 		select {
@@ -1072,6 +1331,17 @@ func (a *app) watch(ctx context.Context, id string, follow bool) error {
 			t.Println()
 			t.Println(t.Gray("detached; task " + id + " keeps running"))
 			return nil
+		case e, ok := <-stream:
+			if !ok { // the subscription dropped: fall back to polling
+				// Resume from what the stream already showed, or the log
+				// replays every event from the start.
+				if _, next, err := a.backend().ReadEvents(id, off); err == nil {
+					off = next
+				}
+				streaming = false
+				continue
+			}
+			rend.Handle(e)
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
@@ -1113,7 +1383,7 @@ It works while the task runs. Without a name, on a terminal, it asks.`,
 				}
 			}
 			old := tk.Title()
-			if err := a.store.Rename(tk, name); err != nil {
+			if err := a.backend().Rename(tk, name); err != nil {
 				return err
 			}
 			a.term.Println(a.term.Green("✓ "), old, a.term.Gray(" → "), a.term.Bold(tk.Name), a.term.Gray(" ("+tk.ID+")"))
@@ -1141,7 +1411,7 @@ func deleteTaskCmd(a *app) *cobra.Command {
 					return err
 				}
 			}
-			if err := a.store.Delete(tk.ID); err != nil {
+			if err := a.backend().Delete(tk.ID); err != nil {
 				return err
 			}
 			a.term.Println(a.term.Green("✓ "), "deleted task ", tk.Label(), a.term.Gray("  (workspace kept: "+tk.Workspace+")"))
@@ -1170,6 +1440,22 @@ func internalRunCmd(a *app) *cobra.Command {
 			}
 			ctx, stop := task.StopContext(cmd.Context())
 			defer stop()
+			// The same preparation the controller does before spawning: a
+			// runner started by spawnRunner's local branch, or by hand, has to
+			// find its clone already made. This is the host that has it.
+			//
+			// Read through the backend, never the store: state goes through the
+			// interface in this process too, which is what the local endpoint
+			// exists for. The runner reaches the same records because
+			// Store.Spawn strips the endpoint from its environment, so it opens
+			// the local backend over the same data dir.
+			tk, err := a.backend().Load(args[0])
+			if err != nil {
+				return err
+			}
+			if err := a.prepareWorkspace(ctx, tk); err != nil {
+				return err
+			}
 			_, err = r.Run(ctx, args[0], true)
 			return err
 		},

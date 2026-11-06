@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dethmasque/ackn4th/internal/event"
@@ -22,7 +23,13 @@ type ProviderFactory func(spec AgentSpec) (provider.Provider, error)
 
 // Runner drives a task's agents: in turn, or in parallel rounds.
 type Runner struct {
-	Store        *Store
+	// Store holds the artifacts that stay on this machine: workspaces,
+	// snapshots, agent conversations, scratch dirs, the run lock.
+	Store *Store
+	// Comm is where the state a CLI reads and writes lives: the task
+	// record, the event log and the live preview. It is the controller
+	// when the daemon talks to a remote CLI, and nil means Store.
+	Comm         Backend
 	Roles        *role.Registry
 	NewProvider  ProviderFactory
 	AllowedRoots []string
@@ -50,6 +57,15 @@ type Runner struct {
 	live   *liveFeed  // streamed output, for dashboards in other processes
 }
 
+// comm is the communication backend: the daemon writes task state through
+// it so a CLI anywhere can watch and reach the task.
+func (r *Runner) comm() Backend {
+	if r.Comm != nil {
+		return r.Comm
+	}
+	return r.Store
+}
+
 // ErrRoundLimit is returned when a task stops because it used its rounds.
 var ErrRoundLimit = errors.New("round limit reached")
 
@@ -65,13 +81,42 @@ func (r *Runner) Run(ctx context.Context, id string, background bool) (*Task, er
 		return nil, err
 	}
 	defer release()
+	// State lives in comm: announce the run there, keep the heartbeat
+	// fresh so a CLI can tell a live runner from a dead one, and clear it
+	// once the outcome is saved.
+	comm := r.comm()
+	// BeginRun also takes over a claim left by a runner that died without
+	// ending its run, so a crashed task can still be resumed.
+	if err := comm.BeginRun(id); err != nil {
+		return nil, fmt.Errorf("record run start: %w", err)
+	}
+	// The run can be cancelled by this side or by the backend (another
+	// host took it over). Both end the run the same way; only the reason
+	// differs.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var lost atomic.Bool
+	beat := make(chan struct{})
+	beating := make(chan struct{})
+	go func() {
+		defer close(beating)
+		heartbeat(comm, id, beat, func() {
+			lost.Store(true)
+			cancelRun()
+		})
+	}()
+	defer func() { _ = comm.EndRun(id) }()
+	// Stop the heartbeat, and wait for it to stop, before EndRun: a
+	// refresh landing after it would recreate the liveness marker and
+	// make delete-task/switch-task refuse for another 30s.
+	defer func() { close(beat); <-beating }()
 	defer func() {
-		if t, err := r.Store.Load(id); err == nil && r.live != nil {
+		if t, err := r.comm().Load(id); err == nil && r.live != nil {
 			r.live.clear(id, len(t.Agents))
 		}
 	}()
 
-	t, err := r.Store.Load(id)
+	t, err := r.comm().Load(id)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +130,7 @@ func (r *Runner) Run(ctx context.Context, id string, background bool) (*Task, er
 		t.Agents[i].SameHandoffs, t.Agents[i].Idle = 0, 0
 	}
 	t.SplitRounds = 0
-	if err := r.Store.Save(t); err != nil {
+	if err := r.comm().Save(t); err != nil {
 		return t, err
 	}
 	how := "start"
@@ -103,13 +148,21 @@ func (r *Runner) Run(ctx context.Context, id string, background bool) (*Task, er
 	} else {
 		defer rn.close()
 		if t.Parallel() {
-			runErr = rn.parallel(ctx)
+			runErr = rn.parallel(runCtx)
 		} else {
-			runErr = rn.sequential(ctx)
+			runErr = rn.sequential(runCtx)
 		}
 	}
 
 	t.PID = 0
+	if lost.Load() {
+		// Another host took the run over: the record, the event log and
+		// the task's budget are the winner's now. Report and stop, rather
+		// than racing it with a second workspace.
+		t.Status = Stopped
+		t.Reason = "run taken over by another host"
+		return t, fmt.Errorf("task %s: %w", id, ErrRunLost)
+	}
 	switch {
 	case runErr == nil:
 		t.Status = Completed
@@ -130,7 +183,7 @@ func (r *Runner) Run(ctx context.Context, id string, background bool) (*Task, er
 		t.Status = Stopped
 		t.Reason = fmt.Sprintf("round limit reached (%d); resume with --rounds to continue", t.MaxRounds)
 		r.emit(t, event.Event{Kind: event.TaskStopped, Text: t.Reason})
-	case ctx.Err() != nil:
+	case runCtx.Err() != nil:
 		t.Status = Stopped
 		t.Reason = "stopped by user"
 		r.emit(t, event.Event{Kind: event.TaskStopped, Text: t.Reason})
@@ -139,12 +192,12 @@ func (r *Runner) Run(ctx context.Context, id string, background bool) (*Task, er
 		t.Reason = runErr.Error()
 		r.emit(t, event.Event{Kind: event.TaskFailed, Text: t.Reason, Error: true})
 	}
-	if err := r.Store.Save(t); err != nil {
+	if err := r.comm().Save(t); err != nil {
 		return t, err
 	}
 	if t.Status == Completed && r.Completed != nil {
 		r.Completed(t)
-		if err := r.Store.Save(t); err != nil {
+		if err := r.comm().Save(t); err != nil {
 			return t, err
 		}
 	}
@@ -185,6 +238,46 @@ func summary(t *Task) string {
 	return strings.TrimSpace(b.String())
 }
 
+// runnerTTL is how long a runner's liveness outlives its last heartbeat.
+var runnerTTL = 2 * time.Minute
+
+// heartbeatInterval is how often a runner refreshes its liveness, well
+// inside runnerTTL. It is a variable so tests need not wait seconds.
+var heartbeatInterval = runnerTTL / 3
+
+// heartbeat keeps the runner's liveness fresh until beat closes, so a CLI
+// watching a remote task can tell a live runner from a dead one. The first
+// beat is the caller's, taken before the claim can be observed.
+//
+// A failed refresh is ignored: one blip must not end liveness for the rest
+// of the run, or a later read would reconcile a live task as failed. Only
+// losing the run to another host ends it, through onLost, so a displaced
+// runner stops spending against a task it no longer owns.
+//
+// ErrNoRun means this client no longer holds a claim (its EndRun already
+// ran, so the beat lost a race with the end of the run). There is nothing
+// left to keep alive, so the loop stops rather than beating into a refusal
+// every interval for the rest of the process's life.
+func heartbeat(comm Backend, id string, beat <-chan struct{}, onLost func()) {
+	t := time.NewTicker(heartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-beat:
+			return
+		case <-t.C:
+			err := comm.Heartbeat(id)
+			if errors.Is(err, ErrRunLost) {
+				onLost()
+				return
+			}
+			if errors.Is(err, ErrNoRun) {
+				return
+			}
+		}
+	}
+}
+
 func (r *Runner) emit(t *Task, e event.Event) {
 	e.Round = t.Round
 	r.emitRaw(t.ID, e)
@@ -197,10 +290,10 @@ func (r *Runner) emitRaw(id string, e event.Event) {
 		e.Time = time.Now()
 	}
 	if !e.Ephemeral() {
-		r.Store.AppendEvent(id, e)
+		r.comm().AppendEvent(id, e)
 	}
 	if r.live == nil {
-		r.live = newLiveFeed(r.Store)
+		r.live = newLiveFeed(r.comm())
 	}
 	r.live.Handle(id, e)
 	if r.Sink != nil {

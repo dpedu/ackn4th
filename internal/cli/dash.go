@@ -58,7 +58,7 @@ opens it too.
 		RunE: func(cmd *cobra.Command, args []string) error {
 			focus := ""
 			if len(args) == 1 {
-				tk, err := a.store.Find(args[0])
+				tk, err := a.backend().Find(args[0])
 				if err != nil {
 					return err
 				}
@@ -121,6 +121,11 @@ func (a *app) dash(ctx context.Context, focus string, speak *bool) error {
 	return dash.Run(opt)
 }
 
+// errRemoteChanges says a task's workspace is not on this machine, so git here
+// cannot count its uncommitted files. The dashboard shows nothing for it, which
+// is what "unknown" looks like there.
+var errRemoteChanges = errors.New("the workspace is on the controller")
+
 // dashOptions wires the dashboard to the store, the runner and the login
 // and provider-setup flows.
 func (a *app) dashOptions(ctx context.Context, focus string, speak *bool) (dash.Options, error) {
@@ -136,21 +141,26 @@ func (a *app) dashOptions(ctx context.Context, focus string, speak *bool) (dash.
 			v.On = *speak
 		}
 	}
-	// A first run, with no tasks yet, opens on the configuration.
+	// A first run, with no tasks yet, opens on the configuration. A controller
+	// that cannot be asked is not a first run: showing somebody with ten tasks
+	// the setup screen because their daemon is restarting reads as "all my work
+	// is gone", and the next thing they do is reconfigure.
 	firstRun := false
 	if a.store != nil {
-		tasks, _ := a.store.List()
-		firstRun = len(tasks) == 0
+		if tasks, err := a.backend().List(); err == nil {
+			firstRun = len(tasks) == 0
+		}
 	}
 	opt := dash.Options{
+		State:   a.backend(),
 		Store:   a.store,
 		Focus:   focus,
 		Effects: a.term.Effects,
 		Stop: func(tk *task.Task) error {
-			return task.Signal(tk.PID)
+			return a.stopRunner(context.Background(), tk)
 		},
 		Resume:   a.resumeBackground,
-		Delete:   func(tk *task.Task) error { return a.store.Delete(tk.ID) },
+		Delete:   func(tk *task.Task) error { return a.backend().Delete(tk.ID) },
 		FollowUp: a.followUpBackground,
 		Launch:   func(req dash.NewTask) (string, error) { return a.dashLaunch(ctx, req) },
 		Login:    loginCommand,
@@ -166,11 +176,21 @@ func (a *app) dashOptions(ctx context.Context, focus string, speak *bool) (dash.
 		},
 		RepoDir: a.repoDir,
 		Uncommitted: func(dir string) (int, error) {
+			if a.remote() {
+				// The workspace is on the controller: git here cannot see it, so
+				// the count is unknown (an error, which the dashboard shows as
+				// nothing) rather than a git process per poll for a path that
+				// does not exist on this machine (R68).
+				return 0, errRemoteChanges
+			}
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			return github.Uncommitted(ctx, dir)
 		},
 		Trusted: func(dir string) bool {
+			if a.remote() {
+				return true // the roots the daemon checks are the daemon's
+			}
 			allowed, err := a.cfg.AllowedRoots()
 			if err != nil {
 				return false
@@ -434,32 +454,48 @@ func (a *app) dashLaunch(ctx context.Context, req dash.NewTask) (string, error) 
 	if req.Parallel && len(agents) < 2 {
 		return "", errors.New("parallel needs at least two agents")
 	}
+	id := task.NewID()
 	dir := expandHome(req.Workspace)
-	allowed, err := a.cfg.AllowedRoots()
-	if err != nil {
-		return "", err
-	}
 	var resolved string
-	if req.Repo != "" {
-		resolved, err = a.repoWorkspace(ctx, req.Repo, allowed, true)
-	} else {
-		resolved, err = workspace.Resolve(dir, allowed, true)
-	}
-	if errors.Is(err, workspace.ErrUntrusted) && req.Trust && req.Repo == "" {
-		if _, err := a.trust(dir); err != nil {
+	if a.remote() {
+		// The dashboard is the same entry point as start-task, so it resolves
+		// the workspace the same way. The daemon owns the directory, its roots
+		// and its clone: a tick box here cannot trust a path on that host (it
+		// would write *this* machine's config.yaml, which the daemon never
+		// reads), and --repo must not clone onto a disk no runner can see.
+		if err := remoteVCSErr(req.Branch, req.DraftPR); err != nil {
 			return "", err
 		}
-		allowed, _ = a.cfg.AllowedRoots()
-		resolved, err = workspace.Resolve(dir, allowed, true)
-	}
-	if err != nil {
-		return "", err
+		f := &runFlags{workspace: dir, repo: req.Repo, branch: req.Branch, draftPR: req.DraftPR}
+		if resolved, err = a.taskWorkspace(ctx, f, id); err != nil {
+			return "", err
+		}
+	} else {
+		allowed, err := a.cfg.AllowedRoots()
+		if err != nil {
+			return "", err
+		}
+		if req.Repo != "" {
+			resolved, err = a.repoWorkspace(ctx, req.Repo, allowed, true)
+		} else {
+			resolved, err = workspace.Resolve(dir, allowed, true)
+		}
+		if errors.Is(err, workspace.ErrUntrusted) && req.Trust && req.Repo == "" {
+			if _, err := a.trust(dir); err != nil {
+				return "", err
+			}
+			allowed, _ = a.cfg.AllowedRoots()
+			resolved, err = workspace.Resolve(dir, allowed, true)
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 	if err := a.useBranch(ctx, resolved, req.Branch, true); err != nil {
 		return "", err
 	}
 	if req.DraftPR {
-		if err := github.CheckPR(ctx, resolved); err != nil {
+		if err := a.checkDraftPR(ctx, resolved); err != nil {
 			return "", fmt.Errorf("draft PR: %w", err)
 		}
 	}
@@ -469,19 +505,19 @@ func (a *app) dashLaunch(ctx context.Context, req dash.NewTask) (string, error) 
 	if err := a.preflight(ctx, agents, false); err != nil {
 		return "", err
 	}
-	tk := &task.Task{ID: task.NewID(), Name: cmp.Or(req.Name, task.DefaultName(req.Prompt)), Prompt: req.Prompt, Workspace: resolved, Agents: agents, MaxRounds: req.Rounds, MaxCost: req.MaxCost, DraftPR: req.DraftPR, Branch: req.Branch}
+	tk := &task.Task{ID: id, Name: cmp.Or(req.Name, task.DefaultName(req.Prompt)), Prompt: req.Prompt, Workspace: resolved, Repo: req.Repo, Agents: agents, MaxRounds: req.Rounds, MaxCost: req.MaxCost, DraftPR: req.DraftPR, Branch: req.Branch}
 	if req.Parallel {
 		tk.Mode = task.ModeParallel
 	}
-	if err := a.store.Create(tk); err != nil {
+	ghContext, err := a.githubBrief(ctx, req.Prompt, true)
+	if err != nil {
 		return "", err
 	}
-	if err := a.fetchGitHub(ctx, tk, true); err != nil {
-		a.store.Delete(tk.ID)
+	if err := a.createTask(tk, ghContext); err != nil {
 		return "", err
 	}
-	if _, err := a.store.Spawn(tk.ID); err != nil {
-		return "", err
+	if err := a.spawnRunner(ctx, tk.ID); err != nil {
+		return tk.ID, err
 	}
 	return tk.ID, nil
 }
@@ -549,11 +585,11 @@ func tildeHome(dir string) string {
 // followUpBackground gives tk a follow-up and starts it in the
 // background, for the dashboard.
 func (a *app) followUpBackground(tk *task.Task, prompt string, team []dash.NewAgent) error {
-	tk, err := a.store.Load(tk.ID) // the dashboard's copy is for showing
+	tk, err := a.backend().Load(tk.ID) // the dashboard's copy is for showing
 	if err != nil {
 		return err
 	}
-	a.store.Reconcile(tk)
+	a.backend().Reconcile(tk)
 	// Sign-ins first: if one is needed, the dashboard retries afterwards,
 	// and the follow-up must not have been added twice.
 	if err := a.dashSignedIn(taskProviders(tk, nil)); err != nil {
@@ -565,11 +601,10 @@ func (a *app) followUpBackground(tk *task.Task, prompt string, team []dash.NewAg
 	if err := a.changeTeam(tk, team); err != nil {
 		return err
 	}
-	if err := a.store.Save(tk); err != nil {
+	if err := a.backend().Save(tk); err != nil {
 		return err
 	}
-	_, err = a.store.Spawn(tk.ID)
-	return err
+	return a.spawnRunner(context.Background(), tk.ID)
 }
 
 // changeTeam gives tk's agents the roles, models and efforts in team (one
@@ -612,7 +647,7 @@ func (a *app) changeTeam(tk *task.Task, team []dash.NewAgent) error {
 		}
 		if n.Model != old.Model {
 			what = append(what, fmt.Sprintf("runs on model %s (was %s), starting a fresh conversation", n.Model, old.Model))
-			if err := a.store.Switch(tk, i, old.Provider, n.Model, n.Effort); err != nil {
+			if err := a.backend().Switch(tk, i, old.Provider, n.Model, n.Effort); err != nil {
 				return err
 			}
 		}
@@ -630,16 +665,16 @@ func (a *app) changeTeam(tk *task.Task, team []dash.NewAgent) error {
 	}
 	f := &tk.FollowUps[len(tk.FollowUps)-1]
 	f.Changes = changes
-	a.store.AppendEvent(tk.ID, event.Event{Kind: event.Notice, Time: time.Now(), Round: tk.Round, Text: "team changed: " + strings.Join(changes, "; ")})
+	a.backend().AppendEvent(tk.ID, event.Event{Kind: event.Notice, Time: time.Now(), Round: tk.Round, Text: "team changed: " + strings.Join(changes, "; ")})
 	return nil
 }
 
 func (a *app) resumeBackground(tk *task.Task, prov string) error {
-	tk, err := a.store.Load(tk.ID) // the dashboard's copy is for showing
+	tk, err := a.backend().Load(tk.ID) // the dashboard's copy is for showing
 	if err != nil {
 		return err
 	}
-	a.store.Reconcile(tk)
+	a.backend().Reconcile(tk)
 	if !tk.Resumable() {
 		return fmt.Errorf("task %s is %s", tk.Label(), tk.Status)
 	}
@@ -656,6 +691,5 @@ func (a *app) resumeBackground(tk *task.Task, prov string) error {
 	if err := a.applySwitch(tk, moves); err != nil {
 		return err
 	}
-	_, err = a.store.Spawn(tk.ID)
-	return err
+	return a.spawnRunner(context.Background(), tk.ID)
 }

@@ -609,7 +609,7 @@ func statusCmd(a *app) *cobra.Command {
 			rl = append(rl, t.Gray("config: "+path))
 			t.Box("WORKSPACE ROOTS", rl)
 
-			tasks, err := a.store.List()
+			tasks, err := a.backend().List()
 			if err != nil {
 				return err
 			}
@@ -622,6 +622,24 @@ func statusCmd(a *app) *cobra.Command {
 				parts = append(parts, statusLabel(t, st)+" "+t.Bold(fmt.Sprint(counts[st])))
 			}
 			t.Box("TASKS", []string{strings.Join(parts, "   ")})
+
+			// Where task state lives is a choice of location, not of
+			// implementation: this machine's data dir (served by this process)
+			// or a controller. Say which is live, and where exactly. The
+			// endpoint goes on its own wrapped line: a box truncates to the
+			// terminal width, and the tail of a path or an address is the part
+			// that says which environment this is — eliding it is worse than
+			// saying nothing.
+			where := "local (this machine's data dir, served in-process)"
+			if a.remote() {
+				where = "controller (shared: tasks run on another host)"
+			}
+			t.Box("TASK STATE", []string{where})
+			if ep, ok := a.backend().(task.Endpointer); ok {
+				for _, line := range ui.Wrap(ep.Endpoint(), t.Width-2) {
+					t.Println(t.Gray("  " + line))
+				}
+			}
 			return nil
 		},
 	}

@@ -376,7 +376,15 @@ func cached(hit, in int64) string {
 }
 
 // outcome prints the closing card for a finished run.
-func outcome(t *ui.Term, tk *task.Task, started time.Time, summary string) {
+// summaryView is how a task's summary.md can be shown here: the path when this
+// host has the file, the text when it came from the controller. A client has no
+// path to print - the file is on the other machine - so it prints the text.
+type summaryView struct {
+	path string
+	text string
+}
+
+func outcome(t *ui.Term, tk *task.Task, started time.Time, summary summaryView) {
 	u := tk.Usage()
 	stats := t.Gray(fmt.Sprintf("round %d · %s in / %s out", tk.Round, ui.Tokens(u.InputTokens), ui.Tokens(u.OutputTokens)) + cached(u.CachedTokens, u.InputTokens))
 	if c := tk.Cost(); c > 0 {
@@ -409,7 +417,7 @@ func outcome(t *ui.Term, tk *task.Task, started time.Time, summary string) {
 }
 
 // forYou lists the action items the agents left for the operator.
-func forYou(t *ui.Term, tk *task.Task, summary string) {
+func forYou(t *ui.Term, tk *task.Task, summary summaryView) {
 	open := tk.OpenTodos()
 	var lines []string
 	if len(open) == 0 {
@@ -430,8 +438,15 @@ func forYou(t *ui.Term, tk *task.Task, summary string) {
 		title = fmt.Sprintf("FOR YOU · %d OPEN", len(open))
 	}
 	t.Box(title, lines)
-	if summary != "" {
-		t.Println(t.Gray("  full summary: "), t.Lime(summary))
+	switch {
+	case summary.path != "":
+		t.Println(t.Gray("  full summary: "), t.Lime(summary.path))
+	case summary.text != "":
+		t.Println()
+		t.Println(t.Gray("  full summary, from the controller:"))
+		for _, l := range strings.Split(summary.text, "\n") {
+			t.Println("  " + l)
+		}
 	}
 }
 

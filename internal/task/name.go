@@ -28,6 +28,9 @@ func (s *Store) readName(id string) string {
 
 // Rename gives a task a new name. It is safe while the task runs.
 func (s *Store) Rename(t *Task, name string) error {
+	if err := checkID(t.ID); err != nil {
+		return err
+	}
 	name, err := CleanName(name)
 	if err != nil {
 		return err

@@ -164,16 +164,16 @@ func (a *app) confirm(err error, question string) error {
 // stop-task).
 func (a *app) taskArg(args []string, only func(*task.Task) bool) (*task.Task, error) {
 	if len(args) > 0 {
-		return a.store.Find(args[0])
+		return a.backend().Find(args[0])
 	}
 	missing := usageError{errors.New("missing <task>: its name or ID")}
-	tasks, err := a.store.List()
+	tasks, err := a.backend().List()
 	if err != nil {
 		return nil, err
 	}
 	var opts []option
 	for _, tk := range tasks {
-		a.store.Reconcile(tk)
+		a.backend().Reconcile(tk)
 		if only != nil && !only(tk) {
 			continue
 		}
@@ -189,5 +189,5 @@ func (a *app) taskArg(args []string, only func(*task.Task) bool) (*task.Task, er
 	if err != nil {
 		return nil, err
 	}
-	return a.store.Find(ids[0])
+	return a.backend().Find(ids[0])
 }

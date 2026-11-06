@@ -17,6 +17,14 @@ import (
 
 // Options configures a dashboard.
 type Options struct {
+	// State is where task records, events and live previews are read from:
+	// the backend the CLI already chose (the file store or a controller), not
+	// a second decision taken here. When a caller leaves it out, newModel
+	// fills it from Store once, at construction - the same rule as the CLI's
+	// single task.OpenBackend call.
+	State task.Backend
+	// Store holds the artifacts that live on the machine running the
+	// runner: log paths and scratch dirs. State reads task state.
 	Store *task.Store
 	// Focus preselects a task by ID or unique prefix.
 	Focus string
@@ -162,6 +170,9 @@ type model struct {
 }
 
 func newModel(opt Options) *model {
+	// The one place a missing State is filled: every dashboard is built here,
+	// so no reader below has to fall back to the store on its own.
+	opt.defaultState()
 	m := &model{opt: opt, live: map[string]*Live{}, follow: true}
 	m.poll()
 	if opt.Tour {
@@ -186,9 +197,25 @@ func (m *model) Init() tea.Cmd {
 	return tick()
 }
 
+// state is the backend task state is read from. An accessor, not a choice:
+// newModel resolved it once (see defaultState), and no reader here re-decides
+// between implementations.
+func (o *Options) state() task.Backend { return o.State }
+
+// defaultState fills State when a caller built Options without one - a test, or
+// an embedder that has only a store. It is called once, from newModel, before
+// anything reads - not from Run, because a test may build a dashboard through
+// newModel alone - so the fill exists in one visible place instead of behind
+// every read.
+func (o *Options) defaultState() {
+	if o.State == nil {
+		o.State = o.Store
+	}
+}
+
 // poll reloads task records and reads new events.
 func (m *model) poll() {
-	tasks, err := m.opt.Store.List()
+	tasks, err := m.opt.state().List()
 	if err != nil {
 		m.err = err
 		return
@@ -206,9 +233,12 @@ func (m *model) poll() {
 		selID = cur.Task.ID
 	}
 	m.tasks = tasks
+	// The backend answered: a poll error from an earlier tick is stale, and a
+	// banner that outlives its cause is worse than none (R63).
+	m.err = nil
 	m.sel = 0
 	for i, t := range tasks {
-		m.opt.Store.Reconcile(t)
+		m.opt.state().Reconcile(t)
 		if t.ID == selID {
 			m.sel = i
 		}
@@ -226,7 +256,7 @@ func (m *model) poll() {
 }
 
 func (m *model) read(l *Live) {
-	evs, off, err := m.opt.Store.ReadEvents(l.Task.ID, l.off)
+	evs, off, err := m.opt.state().ReadEvents(l.Task.ID, l.off)
 	if err != nil {
 		return
 	}
@@ -235,7 +265,7 @@ func (m *model) read(l *Live) {
 		l.Apply(e)
 	}
 	l.sync(l.Task) // the record wins over replayed history
-	l.readLive(m.opt.Store)
+	l.readLive(m.opt.state())
 }
 
 func (m *model) current() *Live {

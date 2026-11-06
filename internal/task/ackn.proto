@@ -1,0 +1,165 @@
+// The controller's gRPC interface: what a client on another machine needs to
+// see and steer the tasks that run here.
+//
+// It mirrors task.Backend one RPC per method. That is deliberate: a rule
+// implemented in two places drifts, and the drift is what breaks. So the
+// server side is the
+// daemon's own file Store behind a switch, and the client side is a thin
+// translation of the same interface - no second copy of the task model, and no
+// second copy of the reconciliation, locking or liveness rules.
+//
+// Task records, events and live previews travel as the JSON the file backend
+// already writes. Mirroring their fields here would be that second copy, and
+// it would have to be edited in lockstep with the Go types for ever.
+syntax = "proto3";
+
+package ackn.v1;
+
+option go_package = "github.com/dethmasque/ackn4th/internal/task/acknpb";
+
+message Empty {}
+
+// Pong answers a liveness check and says what the client is talking to.
+message Pong {
+  string version = 1;   // ackn4th's version string, for skew messages
+  string endpoint = 2;  // where the daemon keeps task state, safe to print
+  bool shared = 3;      // always true here: the state is on this host
+}
+
+// Blob carries one JSON-encoded record: a task, an event or a live preview.
+message Blob { bytes json = 1; }
+
+// CreateRequest carries a new task's record and the GitHub context its brief
+// starts from. Whichever machine can read GitHub fetches that context - usually
+// the client, whose gh the person is signed in to - but the file belongs beside
+// the task, on the host that runs it, so it travels with the record.
+message CreateRequest {
+  bytes json = 1;
+  string github = 2;
+}
+
+// ArtifactRequest names one of a task's run files to read back: the summary a
+// finished run wrote, or the GitHub context of its brief. The name is checked
+// against an allowlist on the daemon - it arrives from a client, and this port
+// has no authentication - so it can never name a path.
+message ArtifactRequest {
+  string task = 1;
+  string name = 2;
+}
+
+message Id { string id = 1; }
+
+message ListReply { repeated bytes tasks = 1; }
+
+message BoolReply { bool value = 1; }
+
+message RenameRequest {
+  bytes json = 1;    // the task, as the client has it
+  string name = 2;
+}
+
+// RenameReply carries the record and the name it now has. A name is kept in
+// its own file rather than in task.json (a running task rewrites that from
+// memory), so it is not part of the record on the wire.
+message RenameReply {
+  bytes json = 1;
+  string name = 2;
+}
+
+message SwitchRequest {
+  bytes json = 1;
+  int32 agent = 2;
+  string provider = 3;
+  string model = 4;
+  string effort = 5;
+}
+
+message EventRequest {
+  string task = 1;
+  bytes json = 2;
+}
+
+message EventsRequest {
+  string task = 1;
+  int64 after = 2;   // the backend's opaque cursor
+}
+
+message EventsReply {
+  repeated bytes events = 1;
+  int64 cursor = 2;
+}
+
+message LiveRequest {
+  string task = 1;
+  int32 agent = 2;
+}
+
+message LiveReply { bytes json = 1; } // absent when there is no preview yet
+
+message LiveWrite {
+  string task = 1;
+  int32 agent = 2;
+  bytes json = 3;
+}
+
+// ControlRequest asks the daemon to start or stop a task's runner. It names the
+// task by id: the client saves the record it edited first, in the same store,
+// so there is one write path rather than a copy travelling with each request.
+message ControlRequest {
+  string id = 1;
+  string action = 2;
+  string task = 3;
+  int64 at_unix_nano = 4;
+}
+
+message ControlReply {
+  bool ok = 1;
+  string message = 2;
+  string error = 3;
+}
+
+// ConfigReply carries the daemon's published settings: the providers, models,
+// limits and workspace roots its tasks actually run under.
+message ConfigReply {
+  string yaml = 1;
+  bool found = 2;
+}
+
+service Ackn {
+  rpc Ping(Empty) returns (Pong);
+
+  rpc Create(CreateRequest) returns (Empty);
+  rpc Save(Blob) returns (Empty);
+  rpc Load(Id) returns (Blob);
+  rpc Find(Id) returns (Blob);
+  rpc List(Empty) returns (ListReply);
+  rpc Delete(Id) returns (Empty);
+  // Rename and Switch change the record they are given (a name lives in its
+  // own file, an agent's model in the task), so they return it: a client that
+  // kept its own copy would disagree with the daemon and undo the change on
+  // its next Save.
+  rpc Rename(RenameRequest) returns (RenameReply);
+  rpc Switch(SwitchRequest) returns (Blob);
+
+  rpc Locked(Id) returns (BoolReply);
+  rpc BeginRun(Id) returns (Empty);
+  rpc EndRun(Id) returns (Empty);
+  rpc Heartbeat(Id) returns (Empty);
+
+  rpc AppendEvent(EventRequest) returns (Empty);
+  rpc ReadEvents(EventsRequest) returns (EventsReply);
+  rpc ReadLive(LiveRequest) returns (LiveReply);
+  rpc WriteLive(LiveWrite) returns (Empty);
+  rpc ClearLive(LiveRequest) returns (Empty);
+
+  // Watch replays the events after the cursor, then streams new ones, so the
+  // UI stays live without polling.
+  rpc Watch(EventsRequest) returns (stream Blob);
+
+  // Artifact reads one of the files a task's run writes beside its record, so a
+  // client on another machine can show the summary this host produced.
+  rpc Artifact(ArtifactRequest) returns (Blob);
+
+  rpc Control(ControlRequest) returns (ControlReply);
+  rpc Config(Empty) returns (ConfigReply);
+}

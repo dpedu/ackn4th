@@ -16,6 +16,14 @@ import (
 // Lock takes the task's run lock, held until release is called or the
 // process exits. It fails if another runner holds it.
 func (s *Store) Lock(id string) (release func(), err error) {
+	if err := checkID(id); err != nil {
+		return nil, err
+	}
+	// The record may live in a shared backend, so nothing has created this
+	// host's copy of the task dir yet (a remote `__run`, a controller).
+	if err := os.MkdirAll(s.Dir(id), 0o700); err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(filepath.Join(s.Dir(id), "run.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -33,21 +41,33 @@ func (s *Store) Lock(id string) (release func(), err error) {
 }
 
 // Locked reports whether a runner currently holds the task's lock.
-func (s *Store) Locked(id string) bool {
+func (s *Store) Locked(id string) (bool, error) {
+	if err := checkID(id); err != nil {
+		return false, err
+	}
 	release, err := s.Lock(id)
 	if err != nil {
-		_, statErr := os.Stat(s.Dir(id))
-		return statErr == nil
+		if _, statErr := os.Stat(s.Dir(id)); statErr != nil {
+			return false, nil // no such task: certainly not locked
+		}
+		return true, nil
 	}
 	release()
-	return false
+	return false, nil
 }
 
 // Spawn starts a background runner for the task, with no console, so it
 // survives the terminal closing; its output goes to runner.log.
 func (s *Store) Spawn(id string) (int, error) {
+	if err := checkID(id); err != nil {
+		return 0, err
+	}
 	exe, err := os.Executable()
 	if err != nil {
+		return 0, err
+	}
+	// Same reason as Lock: the task dir may be on the controller, not here.
+	if err := os.MkdirAll(s.Dir(id), 0o700); err != nil {
 		return 0, err
 	}
 	logf, err := os.OpenFile(s.LogPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -57,6 +77,10 @@ func (s *Store) Spawn(id string) (int, error) {
 	defer logf.Close()
 	start := func(flags uint32) (*exec.Cmd, error) {
 		cmd := exec.Command(exe, "__run", id)
+		// See proc_unix.go: the runner works on this host's copy of the task,
+		// so it must not inherit a client's endpoint and dial its way back to
+		// the controller that started it.
+		cmd.Env = withoutBackendURL(os.Environ())
 		cmd.Stdout, cmd.Stderr = logf, logf
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: flags}
 		return cmd, cmd.Start()
